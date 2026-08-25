@@ -1,0 +1,16 @@
+deepgram-sdk>=3.0.0
+websockets>=12.0
+python-dotenv>=1.0.0
+fastapi
+uvicorn 
+httpx 
+openai 
+python-dotenv
+aiohttp
+groq
+supabase==2.4.2 
+plivo 
+resend
+python-multipart
+aiohttp_cors
+#npm install -D @vitejs/plugin-react@latest 

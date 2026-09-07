@@ -13,7 +13,7 @@ import {
   buildWeeklyData, buildSourceData,
 } from './dashboardShared'
 
-export default function PageDashboard({ records, stats, loading, filter, setFilter, openTranscript, showToast, globalSearch }) {
+export default function PageDashboard({ records, stats, loading, filter, setFilter, openTranscript, showToast }) {
   const total = stats?.total_calls ?? records.length
   const hot = stats?.hot ?? records.filter(r => r.lead_category === 'HOT').length
   const warm = stats?.warm ?? records.filter(r => r.lead_category === 'WARM').length
@@ -25,17 +25,12 @@ export default function PageDashboard({ records, stats, loading, filter, setFilt
   const [pageSize, setPageSize] = useState(10)
 
   const filteredRecords = useMemo(() => {
-    return records
-      .filter(r => filter === 'ALL' || r.lead_category === filter)
-      .filter(r => !globalSearch ||
-        (r.to_number || '').includes(globalSearch) ||
-        (r.name || '').toLowerCase().includes(globalSearch.toLowerCase()) ||
-        (r.summary || '').toLowerCase().includes(globalSearch.toLowerCase()))
-  }, [records, filter, globalSearch])
+    return records.filter(r => filter === 'ALL' || r.lead_category === filter)
+  }, [records, filter])
 
   useEffect(() => {
     setPage(1)
-  }, [filter, globalSearch, pageSize])
+  }, [filter, pageSize])
 
   const totalPages = Math.max(1, Math.ceil(filteredRecords.length / pageSize))
   const pagedRecords = useMemo(() => {

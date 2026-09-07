@@ -48,6 +48,10 @@ const PHONE_HEADER_CANDIDATES = ['phone', 'phone number', 'number', 'mobile', 'c
 const NAME_HEADER_CANDIDATES  = ['name', 'lead name', 'customer name', 'contact name']
 
 export const BATCH_STATUSES = { PENDING: 'Pending', FAILED: 'Failed', UNKNOWN: 'Unknown' }
+// Mirrors campaigns.py's NON_TERMINAL set. A row sitting in any of these
+// business_statuses has NOT actually finished — it just hasn't been
+// re-labeled "Pending" locally (see BUGFIX below).
+const NON_TERMINAL_STATUSES = new Set(['Pending', 'QUEUED', 'DIALING', 'RINGING', 'IN_PROGRESS'])
 export const CONCURRENCY_OPTIONS = [1, 3]
 
 const state = {
@@ -350,7 +354,11 @@ async function dialRow(row, rowIdx, voiceServerUrl, callHandlerUrl) {
     }
     data.call_uuid = resolvedCallUuid
 
-    updateRow(rowIdx, { __call_uuid: data.call_uuid })
+    // BUGFIX — reflect "DIALING" locally right away instead of leaving the
+    // row on "Pending" until the next 20s reconcile tick happens to sync
+    // it. Without this, nextPendingWave() could pick the same still-
+    // in-flight row again for another wave before reconcile ever ran.
+    updateRow(rowIdx, { __call_uuid: data.call_uuid, __status: 'DIALING' })
     await fetch(`${callHandlerUrl}/api/campaigns/attempts/${attemptId}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ call_uuid: data.call_uuid, business_status: 'DIALING' }),
@@ -502,8 +510,20 @@ export async function startBatch(voiceServerUrl, callHandlerUrl) {
   }
 
   control.loopAlive = false; state.running = false; state.activeIndexes = new Set()
-  const stillPending = state.rows.some(r => r.__status === BATCH_STATUSES.PENDING)
-  if (!stillPending) stopReconcileLoop()
+  // BUGFIX (Agent page batch table stuck on "Dialing") — this only checked
+  // for the literal string "Pending". A row whose waitForOutcome() hit its
+  // 30s timeout without a hangup_cause yet is NOT re-added to the dial
+  // loop's pending list (nextPendingWave), so once every row has moved
+  // off "Pending" — even rows still genuinely mid-call, showing "DIALING"/
+  // "RINGING"/etc — the outer while(true) loop above exits and this used
+  // to shut the reconcile interval down immediately. With no more
+  // reconciliation, and that row's own Realtime subscription already
+  // unsubscribed at the timeout, nothing was left to ever fetch its real
+  // hangup cause — the row was frozen on "Dialing" for good. Now the
+  // reconciler keeps polling until every row is in an actually-terminal
+  // state, matching the backend's own NON_TERMINAL definition.
+  const stillActive = state.rows.some(r => NON_TERMINAL_STATUSES.has(r.__status))
+  if (!stillActive) stopReconcileLoop()
   notify()
 }
 

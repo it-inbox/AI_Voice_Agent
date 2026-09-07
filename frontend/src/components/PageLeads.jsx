@@ -308,12 +308,17 @@ export default function PageLeads({ records, loading, openTranscript, showToast,
               style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--green)', fontSize: 12, cursor: 'pointer', textAlign: 'left' }}>
               <PhoneCall size={13} /> Follow-up Call
             </button>
-            <button
-              onClick={async () => { await updateStatus(detail.call_sid, 'CLOSED'); showToast('Deal closed! 🎉') }}
-              disabled={detail.lead_category === 'CLOSED' || statusSaving}
-              style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: detail.lead_category === 'CLOSED' ? 'rgba(74,222,128,0.08)' : 'var(--bg3)', border: `0.5px solid ${detail.lead_category === 'CLOSED' ? 'rgba(74,222,128,0.4)' : 'var(--border)'}`, borderRadius: 8, color: detail.lead_category === 'CLOSED' ? '#4ade80' : 'var(--hot)', fontSize: 12, cursor: detail.lead_category === 'CLOSED' ? 'default' : 'pointer', textAlign: 'left', opacity: detail.lead_category === 'CLOSED' ? 0.7 : 1 }}>
-              <Handshake size={13} /> {detail.lead_category === 'CLOSED' ? 'Deal Closed ✓' : 'Close Deal'}
-            </button>
+            {/* Close Deal only makes sense once a lead has warmed up — hidden for COLD.
+                A rep can still move COLD -> WARM/HOT via the Status dropdown above,
+                which will then reveal this button. */}
+            {['WARM', 'HOT', 'CLOSED'].includes(detail.lead_category) && (
+              <button
+                onClick={async () => { await updateStatus(detail.call_sid, 'CLOSED'); showToast('Deal closed! 🎉') }}
+                disabled={detail.lead_category === 'CLOSED' || statusSaving}
+                style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: detail.lead_category === 'CLOSED' ? 'rgba(74,222,128,0.08)' : 'var(--bg3)', border: `0.5px solid ${detail.lead_category === 'CLOSED' ? 'rgba(74,222,128,0.4)' : 'var(--border)'}`, borderRadius: 8, color: detail.lead_category === 'CLOSED' ? '#4ade80' : 'var(--hot)', fontSize: 12, cursor: detail.lead_category === 'CLOSED' ? 'default' : 'pointer', textAlign: 'left', opacity: detail.lead_category === 'CLOSED' ? 0.7 : 1 }}>
+                <Handshake size={13} /> {detail.lead_category === 'CLOSED' ? 'Deal Closed ✓' : 'Close Deal'}
+              </button>
+            )}
             <button
               onClick={() => {
                 window.open(calendlyLink || 'https://calendly.com', '_blank')

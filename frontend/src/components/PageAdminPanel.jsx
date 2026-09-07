@@ -311,10 +311,18 @@ const S = {
     top: 0,
     zIndex: 2,
   },
+  // BUGFIX (contrast) — readonly cells were being dimmed TWICE: once via
+  // `color: var(--text3)` here (already the darkest text color in the
+  // theme, #4a5568) and again via `opacity: 0.55` in cellDiv below. Stacked,
+  // that put readonly text (id, created_at, and most other PK/timestamp
+  // columns — a large share of every table) at well under WCAG-AA contrast
+  // against the dark navy row background, reading as gray-on-black. Now
+  // dimmed exactly once, using the lighter --text2 so it's still visually
+  // distinct from editable cells but stays legible.
   td: (ro) => ({
     padding: '6px 10px',
     borderBottom: '0.5px solid var(--border)',
-    color: ro ? 'var(--text3)' : 'var(--text1)',
+    color: ro ? 'var(--text2)' : 'var(--text1)',
     maxWidth: 240,
     verticalAlign: 'middle',
   }),
@@ -326,7 +334,6 @@ const S = {
     textOverflow: 'ellipsis',
     whiteSpace: 'nowrap',
     maxWidth: 230,
-    opacity: ro ? 0.55 : 1,
     transition: 'background .12s',
   }),
   cellInput: {

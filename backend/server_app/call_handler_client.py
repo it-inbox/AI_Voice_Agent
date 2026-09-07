@@ -160,7 +160,7 @@ async def save_call_transcript(
     transcript already exists as text (s.history, built live from
     Deepgram's ConversationText events during the call), so this just
     ships that text straight to call_handler.py's /api/call-transcript,
-    which runs it through Groq for lead scoring — no audio recording,
+    which runs it through the LLM for lead scoring — no audio recording,
     no download, no re-transcription needed."""
     if not history:
         clog(call_sid, "save_call_transcript skipped — empty history")
@@ -185,7 +185,7 @@ async def save_call_transcript(
                 if resp.status != 200:
                     clog(call_sid, f"save_call_transcript HTTP {resp.status}")
                 else:
-                    clog(call_sid, "save_call_transcript OK — Groq scoring queued")
+                    clog(call_sid, "save_call_transcript OK — lead scoring queued")
     except Exception as e:
         clog(call_sid, f"save_call_transcript failed: {e}")
 

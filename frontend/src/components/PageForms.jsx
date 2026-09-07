@@ -533,7 +533,7 @@ function SendLogTab({ showToast, formUrl, lastSeenResponsesAt }) {
 // running total of all submissions. Persisted per-browser.
 const LAST_SEEN_KEY = 'forms_last_seen_responses_at'
 
-export default function PageForms({ showToast, globalSearch, setFormCount }) {
+export default function PageForms({ showToast, setFormCount }) {
   const [submissions, setSubmissions] = useState([])
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState(null)
@@ -597,13 +597,6 @@ export default function PageForms({ showToast, globalSearch, setFormCount }) {
 
   function buildSubmissionsQuery(withCount) {
     let q = supabase.from('form_submissions').select('*, calls(lead_category, lead_score)', withCount ? { count: 'exact' } : undefined)
-    // Fix: search used to only filter whatever 200 rows were already in
-    // memory, so a match outside that window was invisible. Search now
-    // queries Supabase directly.
-    if (globalSearch) {
-      const term = `%${globalSearch}%`
-      q = q.or(`name.ilike.${term},email.ilike.${term},service_requirements.ilike.${term}`)
-    }
     // Most recent submission first — already the default; kept explicit
     // since this is exactly the ordering asked for on the Responses tab.
     return q.order('submitted_at', { ascending: false })
@@ -622,11 +615,8 @@ export default function PageForms({ showToast, globalSearch, setFormCount }) {
 
   // Fix: fetch was hardcoded to .limit(200) with no page-size control,
   // always pulling the max regardless of what's shown — this is exactly
-  // what the 10/20/30 selector below is for. Also refetch when the
-  // search term changes (server-side now) and reset to page 0 so a new
-  // search doesn't land on a stale, possibly out-of-range page.
-  useEffect(() => { setPage(0) }, [globalSearch])
-  useEffect(() => { loadSubmissions() }, [page, pageSize, globalSearch])
+  // what the 10/20/30 selector below is for.
+  useEffect(() => { loadSubmissions() }, [page, pageSize])
 
   function handleUseForm(url) {
     localStorage.setItem('google_form_url', url)

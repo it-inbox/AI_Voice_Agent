@@ -12,6 +12,7 @@ import asyncio
 import json
 import queue as sync_queue
 import threading
+import time
 from typing import Callable, Dict
 
 from aiohttp import web
@@ -24,13 +25,14 @@ from deepgram.listen.v1.types import (
     ListenV1UtteranceEnd,
 )
 
-from .audio import _perform_hangup, _start_media_sender, drain_audio_queue, plivo_clear_audio
+from .audio import _perform_hangup, _start_media_sender, drain_audio_queue, hangup_call, plivo_clear_audio
 from . import metrics
 from .config import (
     AMD_MAX_WAIT_S,
     CallOutcome,
     CallState,
     CallType,
+    HOT_LEAD_GRACE_S,
     KEEPALIVE_INTERVAL_S,
     MAX_CALL_DURATION_S,
     RECONNECT_DELAYS,
@@ -41,8 +43,35 @@ from .config import (
     log,
 )
 from .prompts import build_stt_settings
-from .session import Session, clog, log_outcome, run_async, ws_open
+from .session import Session, _sessions, clog, log_outcome, run_async, ws_open
 from .tts_bridge import cancel_inflight_tts, send_to_tts
+
+
+# NEW — how long to wait after a barge-in, with no real user transcript
+# following, before deciding it was a false trigger (echo/click/noise)
+# and replaying the interrupted reply. Was a hardcoded 1.5s; trimmed
+# slightly — long enough that a real reply-in-progress from the caller
+# still lands inside the window, short enough that a false barge-in
+# doesn't leave the caller sitting in dead air quite as long.
+_FALSE_BARGE_IN_RETRY_WAIT_S = 1.1
+
+# NEW — debounce a barge-in BEFORE committing to the disruptive cut,
+# instead of only checking after the fact (that's what
+# _FALSE_BARGE_IN_RETRY_WAIT_S above already did — but by then TTS has
+# already been chopped mid-sentence and the caller heard it happen).
+# Deepgram's ListenV1SpeechStarted fires on ANY detected energy — a
+# click, line noise, or the agent's own voice leaking back into the mic
+# (no acoustic echo cancellation in front of it) — not just real speech.
+# On a noisy line this was firing repeatedly and cutting the agent off
+# mid-reply every time, which is exactly what produced replies that cut
+# off after a few words and forced the caller to re-ask the same
+# question. Give the local RMS onset tracker (_check_barge_in_metrics
+# in audio.py, already running per-frame while the agent is speaking) a
+# brief window to confirm the energy is actually sustained before
+# treating a SpeechStarted event as a real interruption. Real barge-ins
+# are effectively unaffected — human reaction time is far longer than
+# this.
+_BARGE_IN_DEBOUNCE_S = 0.22
 
 
 def _stt_connect(lock: threading.Lock, settings: dict):
@@ -104,33 +133,101 @@ async def amd_max_wait_guard(ws: web.WebSocketResponse, s: Session) -> None:
         pass  # normal path: call ended before the guard's wait elapsed
 
 
+async def _speak_goodbye_and_hangup(
+    ws: web.WebSocketResponse, s: Session, goodbye: str, outcome: str, reason: str,
+) -> None:
+    """Shared tail for every code-driven (non-LLM) forced call ending:
+    the HOT_LEAD_GRACE_S graceful close and the MAX_CALL_DURATION_S hard
+    backstop both do the exact same thing — speak a fixed line, wait it
+    out, hang up for real. Factored out so both stages stay identical
+    instead of duplicating the flush-wait/estimate/hangup dance.
+
+    FIX (race condition): this used to act FIRST — cancel_inflight_tts()
+    + send_to_tts(goodbye) — and only set s.pending_hangup=True
+    afterward. Nothing stopped this from racing the model's own
+    end_conversation() (handle_fn, this file) landing at nearly the same
+    moment: e.g. the model decides to wrap up right around the 3:30 grace
+    point. Both paths could fire — cancel_inflight_tts() here would chop
+    off whatever goodbye the model had already queued to TTS, speak a
+    SECOND, different goodbye over it, and both paths would then run
+    their own independent hangup sequence concurrently. Now this claims
+    pending_hangup atomically under the lock FIRST, and backs off
+    entirely — no TTS, no hangup — if someone else (the LLM path, or an
+    earlier duration_guard stage) already claimed it. Whoever gets there
+    first owns the ending; there is only ever one goodbye."""
+    with s.lock:
+        if s.pending_hangup:
+            clog(s.call_sid, f"skip forced goodbye ({reason}) — hangup already in progress elsewhere")
+            return
+        s.pending_hangup = True
+        if not s.outcome:   # don't clobber an outcome the model already set itself
+            s.outcome = outcome
+
+    log_outcome(s.call_sid, outcome, reason)
+
+    if ws_open(ws):
+        await cancel_inflight_tts(s)          # replaces implicit InjectAgentMessage(behavior="interrupt")
+        await send_to_tts(s, goodbye)
+
+    # Deepgram's SpeakV1Flushed tells us when it's actually done generating
+    # audio for the goodbye, rather than guessing words-per-second. Keep
+    # the old estimate as a timeout floor in case the event never arrives.
+    if ws_open(ws):
+        est_speak_s = max(1.5, len(goodbye.split()) / 2.5)
+        if s.tts_flushed_event:
+            try:
+                await asyncio.wait_for(s.tts_flushed_event.wait(), timeout=est_speak_s + 2.0)
+            except asyncio.TimeoutError:
+                clog(s.call_sid, "goodbye flush event timed out — hanging up on estimate instead")
+            await asyncio.sleep(0.4)   # grace for the last audio chunk(s) to actually reach Plivo
+        else:
+            await asyncio.sleep(est_speak_s)
+    await _perform_hangup(ws, s.call_sid)   # always run — real Plivo hangup, ws-agnostic now
+
+    await asyncio.sleep(5.0)
+    if ws_open(ws):
+        await ws.close()
+
+
 async def duration_guard(ws: web.WebSocketResponse, s: Session) -> None:
-    """Two-stage duration control.
+    """Three-stage duration control.
 
     MIGRATION: rewritten for the raw-API world — there's no more
     UpdatePrompt/InjectUserMessage/InjectAgentMessage socket protocol.
 
-    WARNING_DURATION_S — the model is made duration-aware by appending a
-      time-budget note directly onto s.system_prompt. The NEXT
-      on_turn_complete() call (llm_bridge.py) picks up the updated prompt
-      automatically since it's rebuilt from s.system_prompt on every turn
-      — no socket call needed, and unlike the old UpdatePrompt/
-      InjectUserMessage pair this can't be silently refused.
-    MAX_CALL_DURATION_S — hard backstop regardless of what the model did:
-      cancel whatever TTS is in flight, force-speak a goodbye line, wait
-      out its rough speaking duration (no more AgentAudioDone to await),
-      then hang up.
+    WARNING_DURATION_S (3:00) — the model is made duration-aware by
+      appending a time-budget note directly onto s.system_prompt. The
+      NEXT on_turn_complete() call (llm_bridge.py) picks up the updated
+      prompt automatically since it's rebuilt from s.system_prompt on
+      every turn — no socket call needed, and unlike the old
+      UpdatePrompt/InjectUserMessage pair this can't be silently refused.
+      Prompt-level only: asks the model to ask the caller's permission
+      before wrapping up. Not deterministic — that's what the next two
+      stages are for.
+
+    HOT_LEAD_GRACE_S (3:30) — NEW. Deterministic, code-driven close for
+      HOT/WARM leads specifically: if the model hasn't already ended the
+      call itself by now, speak a fixed "we've notified the team, you'll
+      be reached out to again soon" line and hang up — same mechanism as
+      the hard backstop below, just earlier and only for leads that
+      actually showed interest. Leads that AREN'T hot/warm are left
+      alone here and fall through to the generic MAX_CALL_DURATION_S
+      backstop instead.
+
+    MAX_CALL_DURATION_S (4:00) — hard backstop regardless of what the
+      model (or the 3:30 stage) did: cancel whatever TTS is in flight,
+      force-speak a goodbye line, wait out its rough speaking duration,
+      then hang up. This is the one path with no "ask permission" —
+      by definition there's no time left to wait for a reply.
     """
     try:
         await asyncio.sleep(WARNING_DURATION_S)
-        if not ws_open(ws):
-            return
 
         with s.lock:
             already_warned = s.warning_sent
             s.warning_sent = True
 
-        if not already_warned:
+        if not already_warned and ws_open(ws):
             time_note = (
                 "\n\n--- TIME BUDGET ALERT ---\n"
                 "You are almost out of time on this call. Follow the "
@@ -140,9 +237,26 @@ async def duration_guard(ws: web.WebSocketResponse, s: Session) -> None:
                 s.system_prompt += time_note
             clog(s.call_sid, "duration warning — system_prompt updated for next turn")
 
-        await asyncio.sleep(MAX_CALL_DURATION_S - WARNING_DURATION_S)
-        if not ws_open(ws):
+        # ── Stage 2: 3:30 — deterministic graceful close, HOT/WARM leads only ──
+        await asyncio.sleep(HOT_LEAD_GRACE_S - WARNING_DURATION_S)
+
+        with s.lock:
+            already_decided = s.outcome is not None
+
+        if not already_decided and _is_hot_or_warm_lead(s):
+            clog(s.call_sid, "hot-lead grace point (3:30) reached — closing gracefully")
+            hot_goodbye = (
+                "I've let our team know everything we discussed — they'll be "
+                "reaching back out to you again soon. Thank you so much for "
+                "your time today!"
+            )
+            await _speak_goodbye_and_hangup(
+                ws, s, hot_goodbye, CallOutcome.CALLBACK_REQUESTED, "hot lead — 3:30 grace close",
+            )
             return
+
+        # ── Stage 3: 4:00 — hard backstop for everyone else ──
+        await asyncio.sleep(MAX_CALL_DURATION_S - HOT_LEAD_GRACE_S)
 
         clog(s.call_sid, "hard duration limit reached")
 
@@ -150,54 +264,18 @@ async def duration_guard(ws: web.WebSocketResponse, s: Session) -> None:
             already_decided = s.outcome is not None
         # Only decide CALLBACK_REQUESTED vs CALL_DROPPED here if the model
         # hasn't already ended the call itself (e.g. via the warning-stage
-        # TIME BUDGET rule) — this is a backstop, not a second opinion.
+        # TIME BUDGET rule, or the 3:30 stage above) — this is a backstop,
+        # not a second opinion.
         is_warm = _is_hot_or_warm_lead(s) if not already_decided else False
 
         if already_decided or not is_warm:
             goodbye = "I've got to wrap up now — thank you so much for your time today. Have a great day!"
+            outcome = CallOutcome.CALL_DROPPED
         else:
             goodbye = "I'm so sorry, I've got to run — I don't want to lose touch though, I'll give you a call back to finish this up. Take care!"
+            outcome = CallOutcome.CALLBACK_REQUESTED
 
-        log_outcome(
-            s.call_sid,
-            s.outcome if already_decided else (CallOutcome.CALLBACK_REQUESTED if is_warm else CallOutcome.CALL_DROPPED),
-            "hard duration limit",
-        )
-
-        await cancel_inflight_tts(s)          # NEW — replaces implicit InjectAgentMessage(behavior="interrupt")
-        await send_to_tts(s, goodbye)
-
-        with s.lock:
-            s.pending_hangup = True
-            # Don't clobber an outcome the model already set itself (e.g.
-            # CALLBACK_REQUESTED from the warning stage). If it didn't
-            # decide in time, fall back to the server-side hot/warm check
-            # above — CALLBACK_REQUESTED only for a lead that actually
-            # showed interest, CALL_DROPPED otherwise.
-            if not s.outcome:
-                s.outcome = CallOutcome.CALLBACK_REQUESTED if is_warm else CallOutcome.CALL_DROPPED
-
-        # NEW — Deepgram's SpeakV1Flushed tells us when it's actually done
-        # generating audio for the goodbye, rather than guessing
-        # words-per-second. Still keep the old estimate as a timeout floor
-        # in case the event never arrives (e.g. TTS connection dropped
-        # mid-goodbye) — better to hang up a beat late than hang forever.
-        est_speak_s = max(1.5, len(goodbye.split()) / 2.5)
-        if s.tts_flushed_event:
-            try:
-                await asyncio.wait_for(s.tts_flushed_event.wait(), timeout=est_speak_s + 2.0)
-            except asyncio.TimeoutError:
-                clog(s.call_sid, "goodbye flush event timed out — hanging up on estimate instead")
-            # small grace for the last audio chunk(s) to actually reach
-            # Plivo and play out after Deepgram confirms generation is done
-            await asyncio.sleep(0.4)
-        else:
-            await asyncio.sleep(est_speak_s)
-        await _perform_hangup(ws, s.call_sid)
-
-        await asyncio.sleep(5.0)
-        if ws_open(ws):
-            await ws.close()
+        await _speak_goodbye_and_hangup(ws, s, goodbye, outcome, "hard duration limit")
 
     except asyncio.CancelledError:
         pass
@@ -220,9 +298,32 @@ def handle_fn(fn_name: str, arguments: str, s: Session, call_sid: str) -> Dict:
         outcome = args.get("outcome", CallOutcome.CALL_DROPPED)
         reason  = args.get("reason", "")
         with s.lock:
-            s.outcome        = outcome
+            already_pending = s.pending_hangup   # FIX — same claim pattern as _speak_goodbye_and_hangup
             s.pending_hangup = True
+            if not already_pending:
+                s.outcome = outcome
+        if already_pending:
+            # Model called end_conversation a second time this call (rare,
+            # but seen when it double-reacts across hops). The first call
+            # already owns the ending — don't re-log, don't spawn a
+            # second watchdog on top of the first.
+            clog(call_sid, "end_conversation called again — already ending, ignoring duplicate")
+            return {"success": True, "message": "", "reason": reason, "outcome": outcome}
         log_outcome(call_sid, outcome, reason)
+        # FIX (bug: end_conversation sometimes not hanging up): the normal
+        # path is llm_bridge._hangup_if_pending(), read at the tail of
+        # on_turn_complete() once the goodbye line's been queued to TTS.
+        # That tail is SKIPPED if this turn gets barge-in-cancelled before
+        # reaching it (CancelledError propagates straight out, by design)
+        # and no further real transcript ever follows to launch a fresh
+        # turn (e.g. caller says something too garbled for speech_final to
+        # fire). In that gap s.pending_hangup stays True with nothing left
+        # to act on it — call just sits connected until the 4-min hard
+        # duration_guard backstop. This watchdog is a pure safety net: if
+        # the normal path already finished the call (session cleaned up),
+        # it's a no-op; otherwise it forces the real hangup itself.
+        if s.loop:
+            run_async(_end_conversation_watchdog(s), s.loop)
         return {
             "success": True,
             "message": "Thank you for your time. Have a great day!",
@@ -254,52 +355,129 @@ def handle_fn(fn_name: str, arguments: str, s: Session, call_sid: str) -> Dict:
         return {"success": False, "error": f"unknown fn: {fn_name}"}
 
 
-def _check_amd_ivr_voicemail(call_sid: str, s: Session, user_text: str, close_ws: Callable) -> None:
+_END_CONVERSATION_WATCHDOG_S = 20.0   # generous — normal path finishes in ~5-8s
+
+
+async def _end_conversation_watchdog(s: Session) -> None:
+    """See handle_fn()'s end_conversation branch for why this exists.
+    Gives the normal hangup path (llm_bridge._hangup_if_pending) plenty
+    of time to finish on its own, then force-hangs-up regardless if the
+    call is somehow still connected with pending_hangup still set."""
+    try:
+        await asyncio.sleep(_END_CONVERSATION_WATCHDOG_S)
+    except asyncio.CancelledError:
+        return
+    with s.lock:
+        still_pending = s.pending_hangup
+    call_ended = s.call_sid not in _sessions   # _cleanup() already popped it — normal path won
+    if still_pending and not call_ended:
+        clog(s.call_sid, "end_conversation watchdog fired — forcing hangup")
+        await hangup_call(s.call_sid)
+
+
+def _check_amd_ivr_voicemail(call_sid: str, s: Session, user_text: str, end_call: Callable) -> None:
     """MIGRATION: previously ran inline off every ConversationText event
     (which no longer exists). Now runs off finalized user transcripts
     only — that's the audio actually coming from the far end of the
-    call, which is what voicemail/IVR phrasing would appear in."""
+    call, which is what voicemail/IVR phrasing would appear in.
+
+    FIX (bug: voicemail/IVR "hangup" didn't actually end the call): this
+    used to just close our own media-stream websocket. That does NOT end
+    the underlying phone call — Plivo's <Stream keepCallAlive="true">
+    (set so a dropped WS mid-setup doesn't kill the call) keeps the PSTN
+    leg up in silence regardless, exactly the same failure mode
+    _perform_hangup() (audio.py) was already fixed for on every OTHER
+    hangup path. A detected voicemail/IVR call was sitting connected and
+    silent, burning minutes, until something unrelated eventually ended
+    it. Now routes through _perform_hangup() — the one path that issues
+    the real Plivo REST hangup — same as every other ending in this
+    file. Also claims s.pending_hangup atomically first, same pattern as
+    every other hangup path (see _speak_goodbye_and_hangup /
+    handle_fn's end_conversation branch), so this can't double-fire
+    alongside a concurrent duration_guard/end_conversation close."""
     with s.lock:
         amd_done = s.amd_done
     if amd_done:
         return
+
     lower = user_text.lower()
     if any(p in lower for p in VOICEMAIL_PHRASES):
-        with s.lock:
-            s.call_type = CallType.VOICEMAIL
-            s.amd_done  = True
-        log_outcome(call_sid, CallOutcome.VOICEMAIL, "voicemail phrase in transcript")
-        close_ws()
+        outcome, reason, call_type = CallOutcome.VOICEMAIL, "voicemail phrase in transcript", CallType.VOICEMAIL
     elif "press" in lower and ("for" in lower or "to" in lower):
-        with s.lock:
-            s.call_type = CallType.IVR
-            s.amd_done  = True
-        log_outcome(call_sid, CallOutcome.IVR, "IVR pattern in transcript")
-        close_ws()
+        outcome, reason, call_type = CallOutcome.IVR, "IVR pattern in transcript", CallType.IVR
+    else:
+        return
+
+    with s.lock:
+        s.call_type = call_type
+        s.amd_done  = True
+        already_pending  = s.pending_hangup
+        s.pending_hangup = True
+    if already_pending:
+        clog(call_sid, f"{call_type} detected, but a hangup is already in progress elsewhere — skipping")
+        return
+
+    log_outcome(call_sid, outcome, reason)
+    end_call()
 
 
-def _launch_llm_turn(s: Session, on_turn_complete: Callable, text: str) -> None:
+def _launch_llm_turn(ws: web.WebSocketResponse, s: Session, on_turn_complete: Callable, text: str) -> None:
     """NEW (item 1) — launches the LLM turn as a TRACKED, cancellable
     future instead of true fire-and-forget. Barge-in reads s.active_llm_task
-    and cancels it immediately, so an interrupted turn's Groq stream
+    and cancels it immediately, so an interrupted turn's LLM stream
     actually stops consuming tokens and feeding TTS instead of finishing
-    in the background after the caller's already moved on."""
-    fut = run_async(on_turn_complete(s, text), s.loop)
+    in the background after the caller's already moved on.
+
+    CHANGED: now passes ws through to on_turn_complete so it can actually
+    hang up the call when end_conversation() sets s.pending_hangup — see
+    llm_bridge._hangup_if_pending()."""
+    fut = run_async(on_turn_complete(s, ws, text), s.loop)
 
     def _clear_if_current(done_fut) -> None:
         with s.lock:
             if s.active_llm_task is done_fut:
                 s.active_llm_task = None
+        # FIX (bug 5): done_fut.exception() was never checked, so any
+        # error mid-turn (AttributeError/TypeError/etc.) silently killed
+        # the coroutine — TTS just stopped mid-sentence with no log line
+        # and no fallback spoken to the caller. Surface it now.
+        if done_fut.cancelled():
+            return
+        exc = done_fut.exception()
+        if exc is not None:
+            log.error("[%s] on_turn_complete crashed: %r", s.call_sid, exc)
 
     fut.add_done_callback(_clear_if_current)
     with s.lock:
         s.active_llm_task = fut
 
 
-async def _handle_barge_in_stop(ws: web.WebSocketResponse, s: Session) -> None:
+async def _handle_barge_in_stop(
+    ws: web.WebSocketResponse,
+    s: Session,
+    on_turn_complete: Callable = None,
+    retry_text: str = None,
+) -> None:
     """Bundles the three barge-in-stop actions into one awaited sequence
     so audio-stop latency (item 3) measures real completion, not just
-    fire-and-forget dispatch — then schedules the false-positive check."""
+    fire-and-forget dispatch — then schedules the false-positive check.
+
+    FIX: Deepgram's ListenV1SpeechStarted fires on ANY detected speech
+    energy, including the agent's own voice leaking back into the mic
+    path (no acoustic echo cancellation in front of it) — a click, or
+    line noise. Every one of those was treated as a real barge-in: the
+    in-flight LLM turn got cancelled and TTS cut, unconditionally. If no
+    real user speech then follows, nothing ever triggers a new turn —
+    the caller just sits in dead air until the ghost-call silence timer
+    eventually hangs up on them. This is exactly what the "agent says
+    half a sentence then goes silent, call drops after ~N sec" report
+    was: a false barge-in with nothing to recover it.
+
+    retry_text (the user utterance the cut-off reply was answering) is
+    passed in by the caller only when an actual in-flight LLM turn was
+    interrupted. If no real transcript shows up in the recovery window
+    and nothing has re-interrupted this generation since, replay that
+    turn instead of leaving the line dead."""
     await drain_audio_queue(s.audio_queue)
     if s.stream_sid:
         await plivo_clear_audio(ws, s.stream_sid)
@@ -308,10 +486,16 @@ async def _handle_barge_in_stop(ws: web.WebSocketResponse, s: Session) -> None:
 
     with s.lock:
         history_len_at_barge_in = len(s.history)
-    await asyncio.sleep(1.5)
+        gen_at_barge_in         = s.generation_id
+    await asyncio.sleep(_FALSE_BARGE_IN_RETRY_WAIT_S)
     with s.lock:
         had_transcript = len(s.history) > history_len_at_barge_in
+        still_same_gen = s.generation_id == gen_at_barge_in
     metrics.record_barge_in_outcome(s, had_transcript)
+
+    if not had_transcript and still_same_gen and retry_text and on_turn_complete is not None:
+        clog(s.call_sid, "false barge-in (no speech followed) — retrying interrupted reply")
+        _launch_llm_turn(ws, s, on_turn_complete, retry_text)
 
 
 def stt_listener_thread(
@@ -332,13 +516,51 @@ def stt_listener_thread(
     def run(coro):
         run_async(coro, loop)
 
-    def close_ws():
-        run(ws.close())
+    def end_call():
+        # NEW — used by _check_amd_ivr_voicemail. Real Plivo REST hangup
+        # + ws.close() (via _perform_hangup), not just a bare ws.close() —
+        # see _check_amd_ivr_voicemail's docstring for why a bare
+        # ws.close() alone was never enough to actually end the call.
+        run(_perform_hangup(ws, call_sid))
 
     interim_buf = ""
     try:
         for msg in socket:
             if isinstance(msg, ListenV1SpeechStarted):
+                with s.lock:
+                    currently_speaking = s.agent_speaking
+                    call_ending        = s.pending_hangup
+                if call_ending:
+                    # FIX (bug: end_conversation goodbye barge-in-cancelled,
+                    # call never actually hangs up — the core live-call
+                    # report behind this fix): once end_conversation() has
+                    # set s.pending_hangup=True, the caller saying literally
+                    # anything back — "ok", "bye", "thanks" — while the
+                    # goodbye line is still playing used to register as a
+                    # real barge-in below: task.cancel() on the in-flight
+                    # on_turn_complete, which raises CancelledError INSIDE
+                    # llm_bridge._hangup_if_pending()'s flush-wait — i.e.
+                    # BEFORE _perform_hangup() is ever reached. The goodbye
+                    # gets cut off mid-sentence AND the call never hangs up
+                    # on this turn — pending_hangup is left True with
+                    # nothing left to act on it until the 20s
+                    # _end_conversation_watchdog backstop fires. The call
+                    # is ending either way — ignore any further caller
+                    # speech and let the goodbye + hangup proceed
+                    # undisturbed instead of treating it as something to
+                    # recover from.
+                    clog(call_sid, "speech detected during pending hangup — ignoring, call is ending")
+                    continue
+                if currently_speaking:
+                    # NEW — debounce before committing to a disruptive
+                    # cut. See _BARGE_IN_DEBOUNCE_S above for why.
+                    time.sleep(_BARGE_IN_DEBOUNCE_S)
+                    with s.lock:
+                        sustained = s._local_speech_onset_ts is not None
+                    if not sustained:
+                        clog(call_sid, "barge-in debounce: energy didn't sustain — ignoring, no cut")
+                        continue
+
                 # REPLACES "UserStartedSpeaking" — same barge-in logic, new trigger
                 with s.lock:
                     s.generation_id += 1
@@ -347,19 +569,30 @@ def stt_listener_thread(
                     s.silence_seconds = 0.0
                     task              = s.active_llm_task     # NEW (item 1)
                     s.active_llm_task = None
+                    # FIX — capture what the interrupted reply was
+                    # answering, only when a real in-flight turn existed,
+                    # so a false barge-in (echo/noise, see
+                    # _handle_barge_in_stop) can retry it below instead
+                    # of leaving the call in dead air.
+                    retry_text = None
+                    if task is not None:
+                        for turn in reversed(s.history):
+                            if turn["role"] == "user":
+                                retry_text = turn["text"]
+                                break
                     if s.call_type == CallType.UNKNOWN:
                         s.call_type = CallType.HUMAN
                         s.amd_done  = True
 
                 if task is not None and not task.done():
                     # NEW (item 1) — the biggest improvement: stop the
-                    # in-flight Groq stream right now instead of letting
+                    # in-flight LLM stream right now instead of letting
                     # it keep running (and keep feeding sentences to TTS
                     # for a turn the caller just talked over).
                     task.cancel()
 
                 metrics.record_barge_in_detected(s)   # NEW (item 3)
-                run(_handle_barge_in_stop(ws, s))      # NEW (item 3) — was 3 separate fire-and-forget calls
+                run(_handle_barge_in_stop(ws, s, on_turn_complete, retry_text))   # NEW (item 3) — was 3 separate fire-and-forget calls
                 clog(call_sid, f"barge-in gen={gen_id}")
 
             elif isinstance(msg, ListenV1Results):
@@ -375,9 +608,24 @@ def stt_listener_thread(
                     if not text:
                         continue
                     with s.lock:
+                        # FIX (same live-call end_conversation bug as the
+                        # SpeechStarted guard above): don't launch a fresh
+                        # LLM turn once the call is already ending —
+                        # nothing cancels the ORIGINAL turn that's mid
+                        # goodbye/hangup here (only a real barge-in does,
+                        # and that path is now guarded off too), so
+                        # without this a second on_turn_complete would run
+                        # concurrently with it: overlapping TTS audio,
+                        # possibly its own competing hangup. The call is
+                        # ending — nothing the caller says now changes that.
+                        call_ending = s.pending_hangup
+                    if call_ending:
+                        clog(call_sid, "transcript finalized during pending hangup — ignoring, call is ending")
+                        continue
+                    with s.lock:
                         s.history.append({"role": "user", "text": text})
-                    _check_amd_ivr_voicemail(call_sid, s, text, close_ws)
-                    _launch_llm_turn(s, on_turn_complete, text)     # NEW (item 1) — tracked, cancellable
+                    _check_amd_ivr_voicemail(call_sid, s, text, end_call)
+                    _launch_llm_turn(ws, s, on_turn_complete, text)     # NEW (item 1) — tracked, cancellable
 
             elif isinstance(msg, ListenV1UtteranceEnd):
                 # backstop if speech_final never fired (noisy line, etc.)
@@ -385,9 +633,14 @@ def stt_listener_thread(
                 interim_buf = ""
                 if text:
                     with s.lock:
+                        call_ending = s.pending_hangup   # FIX — same guard as speech_final above
+                    if call_ending:
+                        clog(call_sid, "utterance-end during pending hangup — ignoring, call is ending")
+                        continue
+                    with s.lock:
                         s.history.append({"role": "user", "text": text})
-                    _check_amd_ivr_voicemail(call_sid, s, text, close_ws)
-                    _launch_llm_turn(s, on_turn_complete, text)
+                    _check_amd_ivr_voicemail(call_sid, s, text, end_call)
+                    _launch_llm_turn(ws, s, on_turn_complete, text)
 
     except Exception as e:
         log.error("[%s] stt listener error: %s", call_sid, e)

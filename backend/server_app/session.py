@@ -50,7 +50,7 @@ class Session:
         #   Deepgram never fired SpeechStarted at all.
         "active_llm_task", "tts_send_gen", "tts_flushed_event",
         "_local_speech_onset_ts", "_barge_in_detect_ts", "_missed_flagged",
-        "silence_seconds", "ghost_fired",
+        "silence_seconds", "ghost_fired", "ghost_prompted",
         "call_type", "amd_speech_start", "amd_done",
         "call_state",
         "pending_hangup",
@@ -95,6 +95,7 @@ class Session:
         self._missed_flagged = False
         self.silence_seconds = 0.0
         self.ghost_fired     = False
+        self.ghost_prompted  = False   # NEW — "are you there?" already spoken this silence window
         self.call_type       = CallType.UNKNOWN
         self.amd_speech_start: Optional[float] = None
         self.amd_done        = False

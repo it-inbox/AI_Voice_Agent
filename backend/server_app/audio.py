@@ -21,12 +21,14 @@ from .config import (
     CallType,
     FRAME_DURATION_S,
     GHOST_CALL_TIMEOUT_S,
+    GHOST_CALL_WARNING_S,
     SILENCE_THRESHOLD,
     log,
     plivo_client,
 )
 from . import metrics
 from .session import Session, clog, log_outcome, run_async, ws_open
+from .tts_bridge import send_to_tts   # NEW — "are you there?" ghost-call prompt
 
 # NEW — how long the caller must talk over the agent, with no barge-in
 # registered, before we count it as a missed interruption. Short enough
@@ -165,15 +167,80 @@ async def hangup_call(call_sid: str) -> None:
 
 
 async def _perform_hangup(ws: web.WebSocketResponse, call_sid: str) -> None:
-    if not ws_open(ws):
-        return
+    """FIX (bug: end_conversation not working): this used to bail out
+    entirely — skipping hangup_call() — whenever ws_open(ws) was already
+    False. Plivo can close the media-stream WS on its own (network blip,
+    Plivo-side timing) while keepCallAlive="true" keeps the PSTN call up
+    in silence; when that happened, the REST hangup that actually ends
+    the phone call never fired, so the call just sat connected. The REST
+    hangup must run regardless of ws state — only the ws.close() call
+    itself needs the ws_open() guard."""
     clog(call_sid, "graceful hangup")
-    await asyncio.sleep(1.0)
-    await hangup_call(call_sid)   # CHANGED: actually ends the PSTN call (see hangup_call() note)
-    try:
-        await ws.close()
-    except Exception:
-        pass
+    # FIX (12s to end call): this was a flat 1.0s sleep on EVERY call
+    # site — llm_bridge._hangup_if_pending() and duration_guard already
+    # wait out the real TTS flush event (+0.4s grace) before ever
+    # reaching here, so that 1.0s was pure extra latency stacked on top
+    # of a wait that already covered it. _check_amd's voicemail path
+    # hangs up with nothing spoken at all, so it never needed a full
+    # second either. Trimmed to a small safety buffer for the last audio
+    # chunk(s) to clear the socket, not a second full grace period.
+    await asyncio.sleep(0.2)
+    await hangup_call(call_sid)   # always end the PSTN call via REST, ws state doesn't matter here
+    if ws_open(ws):
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+async def _ghost_are_you_there(ws: web.WebSocketResponse, s: Session, silence_at_fire: float) -> None:
+    """NEW — fired once, at GHOST_CALL_WARNING_S of caller silence, instead
+    of going straight to a hangup. Gives the caller a real chance to
+    respond before the line drops on them mid-listen. Uses the lead's
+    name when we have one, otherwise a plain "are you there?".
+
+    Only a further GHOST_CALL_TIMEOUT_S of silence AFTER this actually
+    ends the call (see _check_ghost_call) — this function does not hang
+    up by itself.
+
+    FIX (bug: LLM's next reply reads disconnected from what the customer
+    actually said — "Thanks for confirming!" out of nowhere, or the
+    original question getting re-asked oddly): this used to speak the
+    prompt via send_to_tts() WITHOUT ever appending it to s.history. The
+    customer's reply ("yes, I'm here") DOES land in history as a user
+    turn (normal STT path, stt_bridge.py) — but the question it's
+    answering never did. The model then sees an orphaned "Yes I'm here"
+    with no idea what it's confirming, and its next reply has to guess.
+    Appended to history now, same as any other agent line, so the
+    customer's reply reads in context on the model's next turn."""
+    if s.ghost_fired:
+        return
+    with s.lock:
+        name = s.facts.get("lead_name") or s.lead_name_hint or None
+    prompt = f"Sorry, are you still there, {name}?" if name else "Sorry, are you still there?"
+    # NEW — real elapsed silence at fire time, logged explicitly. If this
+    # ever reads meaningfully less than GHOST_CALL_WARNING_S on a live
+    # call, that's a real bug worth chasing further — this is the number
+    # to check first instead of guessing from how it felt on a live call.
+    clog(s.call_sid, f"ghost warning fired — silence_seconds={silence_at_fire:.2f}s (threshold={GHOST_CALL_WARNING_S}s), prompting: {prompt!r}")
+    with s.lock:
+        s.history.append({"role": "assistant", "text": prompt})
+    await send_to_tts(s, prompt)
+    # send_to_tts() sets s.agent_speaking = True. On a normal LLM turn
+    # that's cleared at the tail of llm_bridge.on_turn_complete() — but
+    # this isn't a turn, so nothing else will ever clear it. Left set,
+    # _should_analyze() would gate silence detection off for the rest of
+    # the call and the ghost timer would never be able to fire again
+    # (call sits connected forever if the caller really is gone). Clear
+    # it ourselves once the prompt's actually finished playing.
+    if s.tts_flushed_event:
+        try:
+            await asyncio.wait_for(s.tts_flushed_event.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            pass
+        await asyncio.sleep(0.2)   # small grace for the last audio chunk(s) to clear the socket
+    with s.lock:
+        s.agent_speaking = False
 
 
 async def ghost_call_hangup(ws: web.WebSocketResponse, s: Session) -> None:
@@ -181,30 +248,55 @@ async def ghost_call_hangup(ws: web.WebSocketResponse, s: Session) -> None:
         if s.ghost_fired:
             return
         s.ghost_fired = True
-    clog(s.call_sid, f"ghost call fired — {GHOST_CALL_TIMEOUT_S}s silence")
-    log_outcome(s.call_sid, CallOutcome.NO_RESPONSE, "ghost call silence timeout")
+    total_s = GHOST_CALL_WARNING_S + GHOST_CALL_TIMEOUT_S
+    clog(s.call_sid, f"ghost call fired — {total_s}s silence (prompted, no response)")
+    log_outcome(s.call_sid, CallOutcome.NO_RESPONSE, "ghost call silence timeout — no response after 'are you there?' prompt")
     await plivo_clear_audio(ws, s.stream_sid)
     await hangup_call(s.call_sid)
     await ws.close()
 
 
 def _should_analyze(s: Session) -> bool:
-    """Skip rms calc entirely once both detectors are done and agent isn't speaking."""
-    return not s.agent_speaking and (not s.ghost_fired or not s.amd_done)
+    """Skip rms calc entirely once both detectors are done and agent isn't speaking.
+
+    FIX (race): on_turn_complete() resets s.agent_speaking=False BEFORE
+    calling _hangup_if_pending() (llm_bridge.py) — which then still has
+    to wait out the TTS flush + a real Plivo REST hangup, easily a
+    second or two. Same gap exists in duration_guard's
+    _speak_goodbye_and_hangup(). During that window agent_speaking is
+    False but the call is already ending — without this check,
+    _check_ghost_call() could start counting that wait as caller
+    silence and, on a slow hangup, even fire its own "are you there?"
+    prompt or hangup attempt layered on top of the one already in
+    flight. Once s.pending_hangup is set, there's nothing left to detect."""
+    return not s.agent_speaking and not s.pending_hangup and (not s.ghost_fired or not s.amd_done)
 
 
 def _check_ghost_call(ws: web.WebSocketResponse, s: Session, rms: float, loop: asyncio.AbstractEventLoop) -> None:
     if s.ghost_fired:
         return
     if rms < SILENCE_THRESHOLD:
+        should_prompt = False
+        should_hangup = False
         with s.lock:
             s.silence_seconds += FRAME_DURATION_S
             silence = s.silence_seconds
-        if silence >= GHOST_CALL_TIMEOUT_S:
+            if not s.ghost_prompted and silence >= GHOST_CALL_WARNING_S:
+                s.ghost_prompted = True   # claim it now, under the lock — never fire twice
+                should_prompt = True
+            elif s.ghost_prompted and silence >= GHOST_CALL_WARNING_S + GHOST_CALL_TIMEOUT_S:
+                should_hangup = True
+        if should_prompt:
+            run_async(_ghost_are_you_there(ws, s, silence), loop)
+        elif should_hangup:
             run_async(ghost_call_hangup(ws, s), loop)
     else:
+        # Real caller audio — they're there. Reset both the timer and the
+        # "already asked" flag so a LATER silence gap gets its own fresh
+        # "are you there?" prompt instead of going straight to hangup.
         with s.lock:
             s.silence_seconds = 0.0
+            s.ghost_prompted  = False
 
 
 def _check_amd(ws: web.WebSocketResponse, s: Session, rms: float, loop: asyncio.AbstractEventLoop) -> None:

@@ -16,34 +16,56 @@ from typing import Optional
 from .config import HISTORY_REPLAY_TURNS, STT_ENDPOINTING_MS, UTTERANCE_END_MS  # noqa: F401  (HISTORY_REPLAY_TURNS kept for future recap use)
 from .session import Session  # noqa: F401  (kept for type hints elsewhere)
 
+# NEW — explicit tool-use policy. `update_call_state` is gone from
+# FUNCTIONS (config.py) entirely, but the model was also reaching for
+# update_lead_facts / end_conversation reflexively on plain conversational
+# turns (greetings, acknowledgements, clarifying questions) instead of
+# just answering — each one still burns a tool-call hop out of
+# _MAX_TOOL_HOPS before the model ever speaks. Stated up front, ahead of
+# the cost-control rules below, so it governs every tool call, not just
+# the state-tracking one that got removed.
+_TOOL_USE_POLICY = """
+TOOL USE POLICY:
+Only call a tool for a real action/data update. For greetings, acks,
+clarifications, and plain conversational replies, just speak — no tool.
+If you need more than one tool this turn (e.g. update_lead_facts +
+end_conversation), call them together in the SAME reply, not spread
+across turns — every extra hop costs a full LLM call.
+""".strip()
+
 # ── ADDON PROMPT ──────────────────────────────────────────────
 # Always prepended to whatever system prompt is active — whether
 # that's a custom prompt saved from the dashboard (PageAgentProfiles
 # → agent_config.system_prompt) or the _DEFAULT_PROMPT fallback below.
 # This is where call-quality / cost-control guardrails live, so they
 # apply no matter what prompt an agent owner writes in the dashboard.
-_ADDON_PROMPT = """
+#
+# FIX (LLM rate-limiting / TPM pressure): this whole block gets resent
+# as the system message on EVERY hop of EVERY turn (see _build_messages
+# in llm_bridge.py) — it was ~1000 tokens, so a 2-hop turn alone burned
+# 2000 tokens on guardrail text before a word of the actual call.
+# Condensed to the same rules, denser wording — same behavior, roughly
+# half the tokens.
+_ADDON_PROMPT = f"""
 CALL GUARDRAILS (apply on top of everything below — never skip these):
 
-STAY ON TOPIC (cost control — do not let the call wander):
-- A brief pleasantry (weather, "how are you") is fine — let it pass.
-- If the caller steers into an unrelated topic (sports, politics, personal chit-chat, random questions, etc.) and keeps talking about it instead of the call's purpose:
-  - 1st time: warmly acknowledge in ONE short line, then steer straight back to the call purpose. e.g. "Haha, fair enough! Coming back to why I called though — ..."
-  - 2nd time (they drift again after that warning): do NOT warn again. End the call warmly and politely via end_conversation(reason="stayed off-topic after a warning", outcome="OFF_TOPIC"). Say a brief warm goodbye first, e.g. "No worries, I'll let you go — thanks for your time!"
-- Never sound annoyed, robotic, or scolding. Keep it light both times.
+HARD STOP — CALLER WANTS OFF THE CALL (highest priority — overrides every other rule here, TOOL USE POLICY included):
+- The instant the caller unambiguously asks to end the call ("end the call", "hang up", "I have to go", "stop calling me", "not interested, bye") — stop pitching, don't ask another question, don't try to recover it, don't just apologize and keep going.
+- FIRST time they ask: confirm, don't end yet. Say ONE short line asking them to confirm ("Sure thing — should I go ahead and end the call now?") and STOP there — no tool call yet.
+- Once they confirm on their next reply (a "yes", "bye", "go ahead", or anything else affirming) — OR if they ask a second time — say ONE short warm line ("Of course, take care!") and call end_conversation in that SAME reply — DO_NOT_CALL if told not to call again, NOT_INTERESTED if declining, else CALL_DROPPED.
+- Act on the confirmed end immediately even if the audio's been glitchy or unclear — never argue with a clear end request.
 
-NO FLUFFING (cost control — do not let the call ramble):
-- Keep replies to 1-2 sentences. No repeating what you already said in other words.
-- If the caller is just stalling, going in circles, or giving vague non-answers after 2-3 attempts to pin down a real answer, don't keep re-asking — either move the call forward or end it (NOT_INTERESTED / NO_RESPONSE, whichever fits).
-- After two genuinely unresponsive turns (silence, "hmm", "ok" with nothing else) → end_conversation(NO_RESPONSE).
+{_TOOL_USE_POLICY}
 
-TIME BUDGET (cost control — this call has a hard time limit):
-- If you receive a system note that time is almost up, wrap up within your next 1-2 turns — don't start a new topic or ask a new qualifying question.
-- If by that point the lead has shown real interest (they've shared budget, timeline, decision authority, specific pain points, or specific services they want — i.e. you've already called update_lead_facts with something meaningful, or you're in QUALIFICATION/CLOSING): tell them plainly and warmly that you're low on time and will call them back to continue, then call end_conversation(reason="ran out of time with a warm lead", outcome="CALLBACK_REQUESTED").
-- Otherwise (no real interest shown yet): wrap up normally with a warm goodbye and end_conversation with whatever outcome actually fits (NOT_INTERESTED / NO_RESPONSE / etc).
-- Never keep talking past the point you've been told time is up.
+STAY ON TOPIC: a brief pleasantry is fine. If the caller derails into an unrelated topic and keeps at it: 1st time, one warm line then steer back ("Coming back to why I called though — ..."). 2nd time, don't warn again — end_conversation(reason="stayed off-topic after a warning", outcome="OFF_TOPIC") after a brief warm goodbye. Never sound annoyed or scolding.
 
-Always call update_lead_facts immediately whenever company/budget/timeline/pain points/services come up in the conversation.
+NO FLUFFING: 1-2 sentence replies, no restating yourself. After 2-3 vague/stalling non-answers, move the call forward or end it (NOT_INTERESTED/NO_RESPONSE). Two genuinely unresponsive turns in a row → end_conversation(NO_RESPONSE).
+
+TIME BUDGET: on a "time almost up" system note, don't just announce you're wrapping up — ASK permission first, one short line, then end on their reply. Warm lead already qualified (budget/timeline/pain-point captured, or in QUALIFICATION/CLOSING) → tell them you're low on time and ask if it's okay to call them back, THEN end_conversation(outcome="CALLBACK_REQUESTED") on their reply (or right away if they answer in the same breath). Otherwise ask if it's alright to wrap up here, then end with whatever outcome fits on their reply. If a "time's completely up, end the call now" note ever arrives, that's a hard stop — end immediately, no asking, whatever's been said stands.
+
+Call update_lead_facts immediately whenever company/budget/timeline/pain points/services come up.
+
+QUALIFIED HOT LEAD: once budget + timeline + at least one pain point/interested service are captured, stop digging. Say it's a great fit and ASK permission to wrap up ("Sounds like a great fit — is it alright if I have the team follow up with you?"). Only call end_conversation(reason="qualified lead - budget/timeline/pain points captured", outcome="INTERESTED") once they've agreed — on their next reply, or right away if they clearly say yes/sure/sounds good in that same breath. Never call the tool before permission is given.
 """.strip()
 
 # ── DEFAULT PROMPT ───────────────────────────────────────────

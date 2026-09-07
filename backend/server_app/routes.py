@@ -280,6 +280,17 @@ async def _cleanup(s: Session) -> None:
     _sessions.pop(call_sid, None)
 
     if not s.outcome:
+        # BUGFIX (Lead page "Call Status" stuck) — this branch used to only
+        # LOG a CALL_DROPPED outcome without ever assigning it to s.outcome.
+        # save_call_result() below always fires regardless, so it shipped
+        # outcome=None to /api/call-live-facts, which upserts `live_outcome`
+        # as an explicit NULL — the Leads/Dashboard "Call Status" column
+        # then had nothing to show (or kept whatever stale value was written
+        # by an earlier failed attempt for the same lead). Any call that
+        # ends without the agent explicitly calling end_conversation
+        # (network drop, caller hangs up mid-call, exception, etc.) must
+        # still resolve to a real terminal status.
+        s.outcome = CallOutcome.CALL_DROPPED
         log_outcome(call_sid, CallOutcome.CALL_DROPPED, "session ended without outcome")
 
     for task in filter(None, [
@@ -294,7 +305,7 @@ async def _cleanup(s: Session) -> None:
 
     # NEW (item 1) — a turn can still be mid-flight when the call ends
     # (hangup, duration limit, etc.), not just on barge-in. Cancel it too
-    # instead of leaving a dangling Groq stream running past call end.
+    # instead of leaving a dangling LLM stream running past call end.
     if llm_task := s.active_llm_task:
         llm_task.cancel()
 

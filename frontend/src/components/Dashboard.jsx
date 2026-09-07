@@ -158,19 +158,22 @@ export default function Dashboard() {
             </p>
           </div>
 
-          <div style={{ position: 'relative', width: 320 }}>
-            <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text3)' }} />
-            <input
-              value={globalSearch}
-              onChange={e => setGlobalSearch(e.target.value)}
-              placeholder="Search by name, phone, summary…"
-              style={{ width: '100%', background: 'var(--bg2)', border: '0.5px solid var(--border)', borderRadius: 8, padding: '7px 12px 7px 32px', color: 'var(--text1)', fontSize: 12, outline: 'none', boxSizing: 'border-box' }}
-            />
-            {globalSearch && (
-              <X size={12} onClick={() => setGlobalSearch('')}
-                style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text3)', cursor: 'pointer' }} />
-            )}
-          </div>
+          {/* Search only makes sense where records are actually filtered by it — Leads and Conversations. */}
+          {['leads', 'conversations'].includes(page) && (
+            <div style={{ position: 'relative', width: 320 }}>
+              <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text3)' }} />
+              <input
+                value={globalSearch}
+                onChange={e => setGlobalSearch(e.target.value)}
+                placeholder="Search by name, phone, summary…"
+                style={{ width: '100%', background: 'var(--bg2)', border: '0.5px solid var(--border)', borderRadius: 8, padding: '7px 12px 7px 32px', color: 'var(--text1)', fontSize: 12, outline: 'none', boxSizing: 'border-box' }}
+              />
+              {globalSearch && (
+                <X size={12} onClick={() => setGlobalSearch('')}
+                  style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text3)', cursor: 'pointer' }} />
+              )}
+            </div>
+          )}
 
           {!['prompt', 'settings'].includes(page) && (
             <button className={styles.refreshBtn} onClick={fetchAll} disabled={loading}>
@@ -187,10 +190,10 @@ export default function Dashboard() {
           </div>
         )}
 
-        {page === 'dashboard' && <PageDashboard records={records} stats={stats} loading={loading} filter={filter} setFilter={setFilter} openTranscript={openTranscript} showToast={showToast} globalSearch={globalSearch} />}
+        {page === 'dashboard' && <PageDashboard records={records} stats={stats} loading={loading} filter={filter} setFilter={setFilter} openTranscript={openTranscript} showToast={showToast} />}
         {page === 'leads' && <PageLeads records={records} loading={loading} openTranscript={openTranscript} showToast={showToast} fetchAll={fetchAll} agentConfig={agentConfig} globalSearch={globalSearch} goToAgentProfiles={() => setPage('prompt')} />}
         {page === 'conversations' && <PageConversations records={records} loading={loading} openTranscript={openTranscript} globalSearch={globalSearch} />}
-        {page === 'forms' && <PageForms showToast={showToast} globalSearch={globalSearch} setFormCount={setFormCount} />}
+        {page === 'forms' && <PageForms showToast={showToast} setFormCount={setFormCount} />}
         {page === 'analytics' && <PageAnalytics records={records} stats={stats} loading={loading} />}
         {page === 'prompt' && <PageAgentProfiles showToast={showToast} />}
         {page === 'settings' && <PageSettings supabase={supabase} showToast={showToast} onConfigChange={cfg => setAgentConfig(c => ({ ...c, ...cfg }))} />}

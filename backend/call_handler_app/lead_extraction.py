@@ -71,7 +71,16 @@ async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
                 {"role": "system", "content": "You are a sales analyst. Return only valid JSON."},
                 {"role": "user",   "content": EXTRACTION_PROMPT.format(transcript=transcript)},
             ],
-            response_format={"type": "json_object"}, temperature=0.1, max_tokens=800,
+            response_format={"type": "json_object"}, temperature=0.1, max_tokens=1500,
+            # FIX (json_validate_failed / "max completion tokens reached"):
+            # gpt-oss-120b is a reasoning model — it spends part of the
+            # token budget on internal chain-of-thought BEFORE writing the
+            # actual JSON. At max_tokens=800, longer/messier transcripts
+            # could burn the whole budget on reasoning and get cut off
+            # mid-JSON. This task is plain structured extraction, not
+            # multi-step reasoning, so turn reasoning down rather than up —
+            # cheaper, faster, and leaves the full token budget for output.
+            reasoning_effort="low",
         )
         extracted = json.loads(response.choices[0].message.content)
         extracted.setdefault("name", ""); extracted.setdefault("company", "")

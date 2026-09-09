@@ -12,7 +12,7 @@ import PageAnalytics from './PageAnalytics'
 import PageAgentProfiles from './PageAgentProfiles'
 import {
   RefreshCw, Search, AlertCircle, Radio, X,
-  Activity, Users, FileText, BarChart2, MessageSquare, ClipboardList, Settings,
+  Activity, Users, FileText, BarChart2, MessageSquare, ClipboardList, Settings, LogOut,
 } from 'lucide-react'
 import { supabase } from '../supabaseClient'
 import styles from './Dashboard.module.css'
@@ -135,6 +135,16 @@ export default function Dashboard() {
             </button>
           ))}
         </nav>
+        <button
+          onClick={() => supabase.auth.signOut()}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 8, margin: '12px 10px', padding: '9px 12px',
+            background: 'transparent', border: '1px solid var(--border2)', borderRadius: 8,
+            color: 'var(--text2)', fontSize: 13, cursor: 'pointer',
+          }}
+        >
+          <LogOut size={16} /> Log out
+        </button>
       </aside>
 
       <main className={styles.main}>

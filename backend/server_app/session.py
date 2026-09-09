@@ -35,6 +35,10 @@ class Session:
         "audio_sender_task", "keepalive_task", "listener",
         "duration_task", "amd_task", "reconnect_lock", "tts_reconnect_lock",
         "agent_speaking", "generation_id",
+        # NEW — updated on any Deepgram transcript event (interim or
+        # final), used by _handle_barge_in_stop to poll for ongoing
+        # speech instead of a single fixed wait.
+        "last_stt_activity_at",
         # NEW — barge-in improvements:
         # active_llm_task: handle to the in-flight Groq stream so barge-in
         #   can cancel it immediately instead of letting it keep running
@@ -86,6 +90,12 @@ class Session:
         self.reconnect_lock: Optional[asyncio.Lock] = None
         self.tts_reconnect_lock: Optional[asyncio.Lock] = None
         self.agent_speaking  = False
+        # NEW — updated on ANY Deepgram transcript event (interim or
+        # final, non-empty), used by _handle_barge_in_stop to tell "still
+        # actively talking, keep waiting" apart from "genuinely went
+        # quiet" instead of guessing a single fixed timeout for every
+        # interruption length.
+        self.last_stt_activity_at = None
         self.generation_id   = 0
         self.active_llm_task = None
         self.tts_send_gen    = 0

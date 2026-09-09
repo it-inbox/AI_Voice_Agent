@@ -1,6 +1,6 @@
 // src/components/PageAgentProfiles.jsx
 import { useEffect, useState, useRef } from 'react'
-import { PhoneCall, Plus, Trash2, Save, Play, Pause, Square, ArrowRight, Download, RefreshCw } from 'lucide-react'
+import { PhoneCall, Plus, Trash2, Save, Play, Pause, Square, ArrowRight, Download, RefreshCw, Sparkles } from 'lucide-react'
 import { supabase } from '../supabaseClient'
 import styles from './Dashboard.module.css'
 import { CALL_HANDLER_URL } from './dashboardShared'
@@ -13,13 +13,100 @@ import {
   setCountryCode as setBatchCountryCode, setAgentId as setBatchAgentId,
   setConcurrency as setBatchConcurrency,
   loadFromFileInput, loadFromFilePicker, loadFromGoogleSheetCsvUrl,
-  startBatch, pauseBatch, stopBatch, exportBatchSheet, validateRows,
+  startBatch, pauseBatch, endBatch, exportBatchSheet, validateRows, applyPreflightSkips,
   listCampaigns, resumeCampaign, deleteCampaign,
 } from './batchCallStore'
 
 // base URL for the voice server (server.py) — separate from
 // CALL_HANDLER_URL (call_handler.py).
 const VOICE_SERVER_URL = import.meta.env.VITE_VOICE_SERVER_URL || 'http://localhost:8080'
+
+// Starter prompts for non-technical users creating a new agent. Each is a
+// solid, editable starting point — not meant to be used verbatim. Picking
+// one just fills the textarea; nothing is saved until "Save Prompt".
+const PROMPT_TEMPLATES = [
+  {
+    id: 'outbound_sales',
+    label: 'Outbound Sales Caller',
+    description: 'Cold-calls a lead, introduces the product, and books a follow-up.',
+    text: `You are a friendly, professional outbound sales representative calling on behalf of [Company Name].
+
+Goal: introduce [Product/Service], gauge interest, and book a follow-up call or demo if the lead is interested.
+
+Guidelines:
+- Open with a brief, warm introduction and state the reason for the call in one sentence.
+- Ask 1-2 open questions to understand the lead's needs before pitching.
+- Keep responses short and conversational — this is a phone call, not an email.
+- If the lead is not interested, thank them politely and end the call gracefully.
+- If the lead is interested, confirm a specific day/time for a follow-up.
+- Never make promises about pricing or contracts you're not authorized to make.
+- If asked something you don't know, say you'll have a team member follow up rather than guessing.`,
+  },
+  {
+    id: 'appointment_setter',
+    label: 'Appointment Setter',
+    description: 'Focused purely on booking a meeting or demo slot.',
+    text: `You are an appointment-setting assistant calling on behalf of [Company Name].
+
+Goal: secure a confirmed appointment on the lead's calendar for a [demo/consultation] — nothing more.
+
+Guidelines:
+- Keep the call short. Don't pitch the full product — just enough to earn the appointment.
+- Offer 2-3 specific time windows rather than asking "when works for you" open-endedly.
+- Confirm the lead's name, callback number, and preferred time before ending the call.
+- If the lead hesitates, ask one clarifying question about their availability, then offer alternate times.
+- If they decline, thank them and end politely — do not push further on this call.`,
+  },
+  {
+    id: 'lead_qualifier',
+    label: 'Lead Qualifier',
+    description: 'Asks a short set of questions to score how good a fit the lead is.',
+    text: `You are a lead-qualification assistant calling on behalf of [Company Name].
+
+Goal: determine, through a short set of questions, whether this lead is a good fit for [Product/Service], and pass qualified leads on to the sales team.
+
+Ask about (naturally, one at a time, not as a rigid checklist):
+- What problem they're currently trying to solve
+- Their rough budget range or timeline
+- Who else is involved in this decision
+
+Guidelines:
+- Sound curious and helpful, not like an interrogation.
+- Keep the call under a few minutes.
+- If they clearly aren't a fit, thank them for their time and end the call politely.
+- If they are a fit, let them know a specialist will follow up, and confirm the best contact method.`,
+  },
+  {
+    id: 'support_followup',
+    label: 'Customer Support Follow-up',
+    description: 'Checks in after a purchase or support ticket to confirm satisfaction.',
+    text: `You are a customer care assistant calling on behalf of [Company Name] to follow up after a recent [purchase/support ticket].
+
+Goal: confirm the customer's issue was resolved and they're satisfied, and flag anything that needs further attention.
+
+Guidelines:
+- Start by referencing the specific order/ticket so the customer knows this isn't a cold call.
+- Ask directly whether their issue was resolved.
+- If yes, thank them and ask if there's anything else you can help with.
+- If no, apologize, note the details, and let them know a team member will personally follow up.
+- Stay calm and empathetic if the customer is frustrated — never get defensive.`,
+  },
+  {
+    id: 'payment_reminder',
+    label: 'Payment / Renewal Reminder',
+    description: 'Reminds a customer about an upcoming or overdue payment or renewal.',
+    text: `You are a billing assistant calling on behalf of [Company Name] regarding an upcoming [payment/renewal].
+
+Goal: remind the customer of the amount due and date, and help them complete or schedule payment.
+
+Guidelines:
+- Be polite and non-confrontational — this is a reminder, not a collections call.
+- State the amount and due date clearly and early in the call.
+- Offer to help them pay now, or ask if they'd like to arrange a different date.
+- If they say they've already paid, thank them and note it for the team to verify — do not argue.
+- Never ask for full card numbers or sensitive payment details over this call; direct them to a secure payment link instead.`,
+  },
+]
 
 export default function PageAgentProfiles({ showToast }) {
   const [agents, setAgents] = useState([])
@@ -262,6 +349,17 @@ export default function PageAgentProfiles({ showToast }) {
   async function rollbackTo(value) {
     setPrompt(value)
     setDirty(true)
+  }
+
+  async function deleteHistoryEntry(logId) {
+    if (!window.confirm('Delete this saved prompt version? This cannot be undone.')) return
+    const { error } = await supabase.from('prompt_versions').delete().eq('id', logId)
+    if (error) {
+      showToast('Delete failed: ' + error.message, 'err')
+      return
+    }
+    setRollback(prev => prev.filter(r => r.id !== logId))
+    showToast('Version deleted')
   }
 
   async function createAgent() {
@@ -525,6 +623,7 @@ export default function PageAgentProfiles({ showToast }) {
           `these rows will be marked Failed/skipped. Start anyway?`
         )
         if (!ok) return
+        applyPreflightSkips()
       }
     }
 
@@ -542,14 +641,18 @@ export default function PageAgentProfiles({ showToast }) {
     showToast(batch.activeIndexes.size ? 'Pausing — current call(s) will finish' : 'Batch paused')
   }
 
-  function handleStop() {
-    // Same "let active calls finish" semantics as Pause, plus it
-    // doesn't resume — Resume starts a fresh wave picking up PENDING
-    // rows. This is NOT an emergency hangup; there is no live-call
-    // termination here, intentionally, so a Stop click never cuts off
-    // a conversation mid-sentence.
-    stopBatch()
-    showToast(batch.activeIndexes.size ? 'Stopping — current call(s) will finish' : 'Batch stopped')
+  function handleEnd() {
+    // FIX: Pause and the old Stop were functionally near-identical — both
+    // just halted the loop and left Resume/Start able to pick the exact
+    // same rows back up. This is the real distinction the two buttons
+    // needed: Pause is resumable, End is not. Any call(s) already in
+    // flight are left alone either way — this never hangs up a live
+    // conversation — but the uploaded sheet and campaign link are wiped,
+    // so a fresh upload is required to run anything again.
+    const ok = window.confirm('End this batch? The uploaded sheet and its progress will be cleared — this cannot be undone.')
+    if (!ok) return
+    endBatch()
+    showToast(batch.activeIndexes.size ? 'Batch ended — current call(s) will finish, sheet cleared' : 'Batch ended and cleared')
   }
 
   function handleExport() {
@@ -565,6 +668,7 @@ export default function PageAgentProfiles({ showToast }) {
   function batchStatusColor(status) {
     if (status === 'Pending') return 'var(--text3)'
     if (status === 'Failed' || status === 'Unknown') return 'var(--hot)'
+    if (status === 'Skipped (duplicate)') return 'var(--warm)'
     if (status === 'Normal Hangup') return '#4ade80'
     return 'var(--text1)'
   }
@@ -858,11 +962,11 @@ export default function PageAgentProfiles({ showToast }) {
             </button>
           )}
           <button
-            onClick={handleStop}
+            onClick={handleEnd}
             disabled={!batch.running && !batch.hasStarted}
             style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', background: 'transparent', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--hot)', fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: (!batch.running && !batch.hasStarted) ? 0.5 : 1 }}
           >
-            <Square size={14} /> Stop
+            <Square size={14} /> End
           </button>
           <button
             onClick={handleExport}
@@ -1116,6 +1220,38 @@ export default function PageAgentProfiles({ showToast }) {
         </span>
       )}
 
+      {/* SUGGESTED PROMPTS */}
+      {selectedId && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+            <Sparkles size={13} color="var(--accent)" />
+            <span style={{ fontSize: 11, color: 'var(--text2)' }}>
+              Not sure what to write? Start from a template — you can edit it after.
+            </span>
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            {PROMPT_TEMPLATES.map(tpl => (
+              <button
+                key={tpl.id}
+                title={tpl.description}
+                onClick={() => {
+                  if (prompt.trim() && !window.confirm(`Replace the current prompt with the "${tpl.label}" template?`)) return
+                  setPrompt(tpl.text)
+                  setDirty(true)
+                }}
+                style={{
+                  padding: '8px 12px', background: 'var(--bg2)', border: '0.5px solid var(--border2)',
+                  borderRadius: 8, color: 'var(--text1)', fontSize: 12, fontWeight: 500,
+                  cursor: 'pointer', textAlign: 'left',
+                }}
+              >
+                {tpl.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* PROMPT EDITOR */}
       {selectedId && (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 280px', gap: 20 }}>
@@ -1167,12 +1303,21 @@ export default function PageAgentProfiles({ showToast }) {
                 <p style={{ color: 'var(--text3)', margin: '0 0 4px 0', fontSize: 11 }}>
                   {new Date(log.created_at).toLocaleString()}
                 </p>
-                <button
-                  onClick={() => rollbackTo(log.prompt_value)}
-                  style={{ background: 'transparent', border: 'none', padding: 0, color: 'var(--accent)', cursor: 'pointer', fontSize: 11, fontWeight: 500 }}
-                >
-                  Load this version →
-                </button>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                  <button
+                    onClick={() => rollbackTo(log.prompt_value)}
+                    style={{ background: 'transparent', border: 'none', padding: 0, color: 'var(--accent)', cursor: 'pointer', fontSize: 11, fontWeight: 500 }}
+                  >
+                    Load this version →
+                  </button>
+                  <button
+                    onClick={() => deleteHistoryEntry(log.id)}
+                    title="Delete this version"
+                    style={{ background: 'transparent', border: 'none', padding: 2, color: 'var(--text3)', cursor: 'pointer', display: 'flex' }}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
 
                 {hoveredLogId === log.id && (
                   <div

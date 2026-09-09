@@ -49,15 +49,18 @@ from .tts_bridge import cancel_inflight_tts, send_to_tts
 
 # NEW — how long to wait after a barge-in, with no real user transcript
 # following, before deciding it was a false trigger (echo/click/noise)
-# and replaying the interrupted reply. Was a hardcoded 1.5s; trimmed
-# slightly — long enough that a real reply-in-progress from the caller
-# still lands inside the window, short enough that a false barge-in
-# doesn't leave the caller sitting in dead air quite as long.
-_FALSE_BARGE_IN_RETRY_WAIT_S = 1.1
+# and replaying the interrupted reply. FIX: this used to be a single
+# fixed sleep (was 1.5s, then 1.1s, then 2.2s — none of which fit every
+# interruption length). Replaced with a poll in _handle_barge_in_stop
+# that extends as long as last_stt_activity_at keeps advancing (i.e.
+# real ongoing speech), using these three instead of one number:
+_FALSE_BARGE_IN_MIN_WAIT_S   = 1.2   # never decide before this, even if silent immediately
+_FALSE_BARGE_IN_IDLE_GRACE_S = 1.8   # give up once genuinely nothing heard for this long (> UTTERANCE_END_MS's 1.4s gap)
+_FALSE_BARGE_IN_MAX_WAIT_S   = 8.0   # hard ceiling regardless of activity, so dead air can't stretch forever
 
 # NEW — debounce a barge-in BEFORE committing to the disruptive cut,
-# instead of only checking after the fact (that's what
-# _FALSE_BARGE_IN_RETRY_WAIT_S above already did — but by then TTS has
+# instead of only checking after the fact (that's what the
+# _FALSE_BARGE_IN_* wait above already did — but by then TTS has
 # already been chopped mid-sentence and the caller heard it happen).
 # Deepgram's ListenV1SpeechStarted fires on ANY detected energy — a
 # click, line noise, or the agent's own voice leaking back into the mic
@@ -94,9 +97,14 @@ async def keepalive_loop(s: Session) -> None:
         while True:
             await asyncio.sleep(KEEPALIVE_INTERVAL_S)
             try:
-                await asyncio.to_thread(
-                    s.stt_conn.send, json.dumps({"type": "KeepAlive"})
-                )
+                # FIX: newer deepgram-sdk (v6+, the "V1SocketClient" seen
+                # in the old error) removed the raw .send(json string)
+                # method in favor of named control methods. requirements.txt
+                # pins deepgram-sdk>=3.0.0 with no upper bound, so this
+                # broke silently the moment the environment resolved a
+                # newer SDK version — every keepalive attempt failed and
+                # the whole loop died after the very first one, every call.
+                await asyncio.to_thread(s.stt_conn.send_keep_alive)
             except Exception as e:
                 clog(s.call_sid, f"keepalive failed: {e}")
                 break
@@ -170,16 +178,20 @@ async def _speak_goodbye_and_hangup(
         await send_to_tts(s, goodbye)
 
     # Deepgram's SpeakV1Flushed tells us when it's actually done generating
-    # audio for the goodbye, rather than guessing words-per-second. Keep
-    # the old estimate as a timeout floor in case the event never arrives.
+    # audio for the goodbye — not when Plivo has finished playing it out
+    # over the phone line (generation is faster than real-time). Keep the
+    # old estimate as a timeout floor in case the event never arrives, AND
+    # as the actual post-flush wait — otherwise this hangs up on the
+    # caller mid-goodbye. Same fix as llm_bridge.py's on_turn_complete /
+    # _hangup_if_pending.
     if ws_open(ws):
         est_speak_s = max(1.5, len(goodbye.split()) / 2.5)
         if s.tts_flushed_event:
             try:
-                await asyncio.wait_for(s.tts_flushed_event.wait(), timeout=est_speak_s + 2.0)
+                await asyncio.wait_for(s.tts_flushed_event.wait(), timeout=est_speak_s + 8.0)
             except asyncio.TimeoutError:
                 clog(s.call_sid, "goodbye flush event timed out — hanging up on estimate instead")
-            await asyncio.sleep(0.4)   # grace for the last audio chunk(s) to actually reach Plivo
+            await asyncio.sleep(est_speak_s + 0.4)
         else:
             await asyncio.sleep(est_speak_s)
     await _perform_hangup(ws, s.call_sid)   # always run — real Plivo hangup, ws-agnostic now
@@ -487,10 +499,36 @@ async def _handle_barge_in_stop(
     with s.lock:
         history_len_at_barge_in = len(s.history)
         gen_at_barge_in         = s.generation_id
-    await asyncio.sleep(_FALSE_BARGE_IN_RETRY_WAIT_S)
-    with s.lock:
-        had_transcript = len(s.history) > history_len_at_barge_in
-        still_same_gen = s.generation_id == gen_at_barge_in
+    # FIX: a single fixed sleep before checking can't fit every
+    # interruption length — a short "no" finalizes fast, but "which
+    # company are you from" needs real speech time PLUS Deepgram's own
+    # UTTERANCE_END_MS silence gap on top of that before it ever lands in
+    # s.history. A fixed wait either cuts off longer replies too early
+    # (marking them false) or makes short ones wait needlessly. Poll
+    # instead: keep waiting as long as last_stt_activity_at (any interim
+    # or final transcript event, see stt_bridge.py's ListenV1Results
+    # handler) keeps advancing — that's real, ongoing speech, not
+    # silence. Only give up once genuinely nothing has been heard for
+    # _FALSE_BARGE_IN_IDLE_GRACE_S, bounded by a hard ceiling so a caller
+    # is never left in dead air indefinitely on some edge case.
+    barge_in_ts = time.time()
+    deadline    = barge_in_ts + _FALSE_BARGE_IN_MAX_WAIT_S
+    had_transcript = False
+    still_same_gen = True
+    while True:
+        await asyncio.sleep(0.25)
+        with s.lock:
+            had_transcript = len(s.history) > history_len_at_barge_in
+            still_same_gen = s.generation_id == gen_at_barge_in
+            last_activity  = s.last_stt_activity_at
+        if had_transcript or not still_same_gen:
+            return   # real speech landed (or something else already superseded this) — nothing to retry
+        now = time.time()
+        heard_recently = last_activity is not None and last_activity >= barge_in_ts and (now - last_activity) < _FALSE_BARGE_IN_IDLE_GRACE_S
+        if heard_recently and now < deadline:
+            continue   # still actively talking — keep waiting
+        if now - barge_in_ts >= _FALSE_BARGE_IN_MIN_WAIT_S:
+            break      # genuinely quiet for a while, or hit the ceiling — safe to decide now
     metrics.record_barge_in_outcome(s, had_transcript)
 
     if not had_transcript and still_same_gen and retry_text and on_turn_complete is not None:
@@ -599,6 +637,8 @@ def stt_listener_thread(
                 alt = msg.channel.alternatives[0] if msg.channel.alternatives else None
                 if not alt or not alt.transcript:
                     continue
+                with s.lock:
+                    s.last_stt_activity_at = time.time()
                 if msg.is_final:
                     interim_buf += (" " + alt.transcript).strip()
                 if msg.speech_final:

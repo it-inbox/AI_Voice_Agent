@@ -30,6 +30,16 @@ from dotenv import load_dotenv
 from groq import AsyncGroq   # kept for lead-scoring leg (call_handler_app) — NOT used for live-call LLM anymore
 from openai import AsyncOpenAI   # NEW — used for both OpenAI and Cerebras (Cerebras is OpenAI-API-compatible via base_url)
 
+# FIX: load_dotenv() used to run AFTER logging.basicConfig() below, but
+# basicConfig reads os.getenv("LOG_LEVEL", ...) — .env hadn't been loaded
+# into the environment yet at that point, so LOG_LEVEL always silently
+# fell back to the "WARNING" default no matter what .env actually said.
+# Every clog()/log.info() call in the whole voice pipeline (barge-in,
+# ghost-warning, outbound-call-placed, hangup handling, etc.) was
+# invisible as a result. Moved above basicConfig so the env var is
+# actually available when read.
+load_dotenv()
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "WARNING").upper(),
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -37,8 +47,6 @@ logging.basicConfig(
 log = logging.getLogger("voice_agent")
 logging.getLogger("websockets").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
-
-load_dotenv()
 
 DEEPGRAM_API_KEY  = os.getenv("DEEPGRAM_API_KEY") or ""
 

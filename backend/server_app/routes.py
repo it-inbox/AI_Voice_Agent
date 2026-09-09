@@ -109,14 +109,22 @@ async def plivo_answer(request: web.Request) -> web.Response:
         agent_id = explicit_agent_id
         clog(call_uuid, f"answer webhook (outbound) — to={to_number} → agent_id={agent_id}")
     else:
-        agent_id = await resolve_agent_for_call(to_number)
-        if agent_id is None:
-            clog(call_uuid, f"REJECTED — no agent mapped for to={to_number}")
-            return web.Response(
-                text='<?xml version="1.0" encoding="UTF-8"?><Response><Reject/></Response>',
-                content_type="application/xml",
-            )
-        clog(call_uuid, f"answer webhook — to={to_number} → agent_id={agent_id}")
+        # Inbound call (no agent_id on the query string — that's only ever
+        # set by place_outbound_call). We deliberately do NOT run the AI
+        # pipeline for these: a caller dialing our agent's number back
+        # would otherwise burn STT/LLM/TTS minutes for free. Play a fixed
+        # message and hang up — no Stream, no WebSocket, no agent cost.
+        clog(call_uuid, f"REJECTED (inbound) — to={to_number} — static message, no AI pipeline")
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Response>'
+            '<Speak voice="WOMAN" language="en-US">'
+            "Thank you for calling. We'll shortly connect you with our sales team."
+            '</Speak>'
+            '<Hangup/>'
+            '</Response>'
+        )
+        return web.Response(text=xml, content_type="application/xml")
 
     asyncio.ensure_future(fetch_agent_config(agent_id))
 

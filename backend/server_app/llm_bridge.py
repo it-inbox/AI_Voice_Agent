@@ -203,10 +203,17 @@ async def _hangup_if_pending(ws: web.WebSocketResponse, s: Session, spoken_text:
     est_speak_s = max(1.2, len(spoken_text.split()) / 2.5) if spoken_text.strip() else 2.0
     if s.tts_flushed_event:
         try:
-            await asyncio.wait_for(s.tts_flushed_event.wait(), timeout=est_speak_s + 3.0)
+            # Ceiling only, guarding against the flush event never
+            # arriving — see the matching fix in on_turn_complete above
+            # for why this can't double as the playback-time estimate.
+            await asyncio.wait_for(s.tts_flushed_event.wait(), timeout=est_speak_s + 10.0)
         except asyncio.TimeoutError:
             clog(s.call_sid, "end_conversation flush wait timed out — hanging up anyway")
-        await asyncio.sleep(0.4)   # grace for last audio chunk(s) to reach Plivo
+        # FIX: same generation-done != playback-done gap as
+        # on_turn_complete — without this, the call could hang up while
+        # the goodbye line was still audibly playing, cutting the agent
+        # off mid-sentence.
+        await asyncio.sleep(est_speak_s + 0.4)
     else:
         await asyncio.sleep(est_speak_s)
     await _perform_hangup(ws, s.call_sid)
@@ -264,7 +271,19 @@ async def on_turn_complete(s: Session, ws: web.WebSocketResponse, user_text: str
     # accounting — that time is the agent's own latency, not the caller
     # failing to respond.
     with s.lock:
-        s.agent_speaking = True
+        s.agent_speaking  = True
+        # FIX (ghost "are you there?" firing right after the agent's own
+        # sentence): agent_speaking=True EXCLUDES this whole thinking+
+        # speaking window from silence accounting, but doesn't zero the
+        # counter — any silence already accumulated before this turn
+        # started (e.g. STT's own 300-500ms endpointing wait) survived
+        # frozen through the excluded window and resumed counting the
+        # instant the agent stopped talking, handing the caller a
+        # shortened window instead of the full GHOST_CALL_WARNING_S.
+        # Reset here so every turn gives the caller a fresh full window
+        # to respond, same as the equivalent reset in deepgram_bridge.py.
+        s.silence_seconds = 0.0
+        s.ghost_prompted  = False
 
     final_text = ""
     hard_fail  = False
@@ -446,29 +465,34 @@ async def on_turn_complete(s: Session, ws: web.WebSocketResponse, user_text: str
                     s.history.append({"role": "assistant", "text": _FALLBACK_LINE})
                 final_text = _FALLBACK_LINE
 
-    # FIX (root cause — this is the actual fix, the docstring further up
-    # was only the setup for it): don't clear agent_speaking the instant
-    # the last send_to_tts() call returns — that's text-handoff time, not
-    # playback-finished time. Wait for Deepgram to confirm it's done
-    # GENERATING all of it (tts_flushed_event), then add a short estimate
-    # for the remaining real-world PLAYBACK time over the phone line
-    # (Plivo has no "audio finished playing" ack to wait on directly —
-    # same word-count/2.5-wps estimate already used for the goodbye lines
-    # in duration_guard/_hangup_if_pending). Skipped entirely when
-    # pending_hangup is set: _should_analyze() (audio.py) already
-    # excludes that case on its own, and _hangup_if_pending() below does
-    # its own equivalent flush-wait right after this — no need to wait
-    # twice.
+    # FIX (root cause — the previous fix here was incomplete): the
+    # comment below used to claim this waits for "generation done" +
+    # "a short estimate for remaining playback time" — but the code only
+    # ever used est_speak_s as the TIMEOUT for waiting on
+    # tts_flushed_event, then added a flat 0.4s regardless. Deepgram
+    # generates audio faster than real-time, so tts_flushed_event
+    # ("done generating") fires long before Plivo has actually finished
+    # PLAYING a multi-second reply out over the phone line. Result:
+    # agent_speaking flipped False — and the ghost-silence timer started
+    # — while the caller was still audibly mid-sentence, not silent at
+    # all. Now: after generation is confirmed done, actually sleep out
+    # the estimated real playback duration before clearing agent_speaking.
     with s.lock:
         pending_hangup_now = s.pending_hangup
     if total_spoken_text.strip() and not pending_hangup_now:
         est_speak_s = max(1.0, len(total_spoken_text.split()) / 2.5)
         if s.tts_flushed_event:
             try:
-                await asyncio.wait_for(s.tts_flushed_event.wait(), timeout=est_speak_s + 3.0)
+                # Generous fixed ceiling here — this just guards against
+                # the flush event never arriving at all; it's no longer
+                # doing double duty as the playback-time estimate.
+                await asyncio.wait_for(s.tts_flushed_event.wait(), timeout=est_speak_s + 10.0)
             except asyncio.TimeoutError:
                 clog(call_sid, "tts flush wait timed out — clearing agent_speaking on estimate instead")
-            await asyncio.sleep(0.4)   # grace for the last audio chunk(s) to actually reach Plivo
+            # Generation finishing != playback finishing (see above) —
+            # wait out the actual estimated speaking time now, plus a
+            # small grace for the last audio chunk(s) to reach Plivo.
+            await asyncio.sleep(est_speak_s + 0.4)
         else:
             await asyncio.sleep(est_speak_s)
 

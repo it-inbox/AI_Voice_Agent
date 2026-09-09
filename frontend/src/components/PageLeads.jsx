@@ -207,7 +207,7 @@ export default function PageLeads({ records, loading, openTranscript, showToast,
                     <td><Badge category={r.lead_category} /></td>
                     <td><StarScore score={r.lead_score || 1} /></td>
                     <td style={{ fontWeight: 500, color: 'var(--green)' }}>{r.budget || '—'}</td>
-                    <td className={styles.mono} >{r.live_outcome || '—'}</td>
+                    <td className={styles.mono} >{r.hangup_cause || r.live_outcome || '—'}</td>
                     <td style={{ color: 'var(--text2)', fontSize: 12 }}>{r.last_contacted_at ? fmtDateTime(r.last_contacted_at) : fmtDateTime(r.timestamp)}</td>
                     <td style={{ color: 'var(--text2)', whiteSpace: 'nowrap' }}>{fmtDate(r.timestamp)}</td>
                     <td onClick={e => e.stopPropagation()}>

@@ -12,6 +12,7 @@ import plivo
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from .campaigns import NON_TERMINAL
 from .config import (
     PLIVO_ANSWER_URL,
     PLIVO_APP_NAME,
@@ -35,13 +36,32 @@ async def _verify_plivo_signature(request: Request) -> Dict[str, str]:
     nonce     = request.headers.get("X-Plivo-Signature-V3-Nonce", "")
     if not signature or not nonce:
         raise HTTPException(status_code=403, detail="Missing Plivo signature headers")
-    url = str(request.url)
+    # FIX (silent signature failures behind a tunnel/proxy): request.url
+    # reflects the raw connection uvicorn sees internally — scheme is
+    # always "http" and the host may be the internal one, never what
+    # Plivo actually called (e.g. "https://xyz.trycloudflare.com"). That
+    # mismatch fails validate_v3_signature every time, with no log line
+    # anywhere on this path (the `if not valid` branch below had none at
+    # all) — completely silent 403s. Rebuild the URL from the standard
+    # forwarded headers, same pattern already used in server_app's
+    # plivo_answer() for the WS host, so the URL used for verification
+    # matches what Plivo actually signed.
+    scheme = request.headers.get("X-Forwarded-Proto", request.url.scheme)
+    host   = request.headers.get("X-Forwarded-Host") or request.headers.get("Host", request.url.netloc)
+    url    = f"{scheme}://{host}{request.url.path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
     try:
         valid = plivo.utils.validate_v3_signature("POST", url, nonce, PLIVO_AUTH_TOKEN, signature, params)
     except Exception as exc:
         logger.warning("Plivo signature verification error: %s", exc)
         raise HTTPException(status_code=403, detail="Signature verification error")
     if not valid:
+        # NEW — this branch previously had NO log line at all, meaning a
+        # rejected webhook here produced zero terminal output, making it
+        # indistinguishable from the request never arriving in the first
+        # place.
+        logger.warning("Plivo signature INVALID — url=%s (check CALL_HANDLER_URL / tunnel scheme+host match)", url)
         raise HTTPException(status_code=403, detail="Invalid Plivo signature")
     return params
 
@@ -64,6 +84,7 @@ async def plivo_hangup(request: Request):
 
     call_uuid    = (params.get("CallUUID") or "").strip()
     hangup_cause = params.get("HangupCauseName") or params.get("HangupCause") or ""
+    to_number    = (params.get("To") or "").strip()
 
     if not call_uuid:
         logger.warning("Hangup webhook fired with no CallUUID — params=%s", params)
@@ -78,12 +99,33 @@ async def plivo_hangup(request: Request):
         result = await asyncio.to_thread(_with_retry, _update)
         if not result.data:
             logger.warning("Hangup webhook: no calls row matched call_sid=%s", call_uuid)
+        else:
+            # NEW — explicit success line. --no-access-log on uvicorn hides
+            # the normal per-request log, and this handler previously had
+            # no log statement at all on the success path, making it
+            # impossible to tell "webhook never arrived" apart from
+            # "webhook arrived and worked fine" just by watching the
+            # terminal.
+            logger.info("Hangup webhook received — call_uuid=%s hangup_cause=%s", call_uuid, hangup_cause)
     except Exception as e:
         logger.error("Hangup webhook Supabase update failed — call_uuid=%s: %s", call_uuid, e)
 
     # NEW — campaign attempt update, same event, no separate webhook needed.
+    # FIX (root cause of "stuck DIALING forever" for rejected/busy/no-
+    # answer calls): call_attempts.call_uuid only ever gets written once
+    # the ANSWER webhook fires and the dashboard resolves it — but Plivo
+    # never fires answer_url for a call that was never actually answered.
+    # This hangup webhook DOES still fire for those (with the real cause,
+    # e.g. "Busy Line"), but matching strictly on call_uuid found zero
+    # rows, so the update silently no-opped and the row sat on DIALING
+    # forever. Fallback: if no row matches call_uuid, match the most
+    # recent still-in-flight row for this phone number instead, and
+    # backfill call_uuid onto it at the same time. Safe because
+    # duplicate numbers are already excluded pre-flight and only
+    # CONCURRENCY numbers are ever dialing at once — at most one
+    # non-terminal row per number can exist at a time.
     def _update_attempt():
-        return (
+        result = (
             _get_supabase().table("call_attempts")
             .update({
                 "hangup_cause":    hangup_cause,
@@ -92,15 +134,46 @@ async def plivo_hangup(request: Request):
             })
             .eq("call_uuid", call_uuid).execute()
         )
+        if result.data or not to_number:
+            return result
+        # Fallback match: PostgREST doesn't support order+limit on an
+        # UPDATE, so find the target row's id with a SELECT first, then
+        # update that exact row — avoids any risk of touching more than
+        # the one intended row if this ever matches more than one.
+        candidate = (
+            _get_supabase().table("call_attempts")
+            .select("id")
+            .eq("to_number", to_number)
+            .is_("call_uuid", "null")
+            .in_("business_status", list(NON_TERMINAL))
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not candidate.data:
+            return result
+        return (
+            _get_supabase().table("call_attempts")
+            .update({
+                "call_uuid":       call_uuid,
+                "hangup_cause":    hangup_cause,
+                "business_status": business_status(hangup_cause),
+                "ended_at":        datetime.utcnow().isoformat(),
+            })
+            .eq("id", candidate.data[0]["id"]).execute()
+        )
     try:
         result2 = await asyncio.to_thread(_with_retry, _update_attempt)
         if result2.data:
             lead_id = result2.data[0]["lead_id"]
             status  = result2.data[0]["business_status"]
+            logger.info("Hangup webhook: call_attempts updated — call_uuid=%s status=%s", call_uuid, status)
             await asyncio.to_thread(
                 _with_retry,
                 lambda: _get_supabase().table("campaign_leads").update({"status": status}).eq("lead_id", lead_id).execute()
             )
+        else:
+            logger.debug("Hangup webhook: no campaign attempt row for call_uuid=%s", call_uuid)
     except Exception as e:
         logger.debug("Hangup webhook: no campaign attempt row for call_uuid=%s (%s)", call_uuid, e)
 

@@ -209,8 +209,8 @@ async def place_outbound_call(to_number: str, agent_id: str, host: str, lead_nam
                 data = await resp.json() if resp.status == 200 else {}
     except Exception as e:
         import traceback
-        log.error("outbound call create failed — to=%s agent_id=%s\nanswer_url=%r\n%s",
-                   to_number, agent_id, answer_url, traceback.format_exc())
+        log.error("number-for-agent lookup failed — to=%s agent_id=%s\n%s",
+                   to_number, agent_id, traceback.format_exc())
         return {"error": f"Plivo call create failed: {e}"}
 
     from_number = data.get("number")
@@ -227,6 +227,14 @@ async def place_outbound_call(to_number: str, agent_id: str, host: str, lead_nam
     # forward it to the WS session, same call every time.
     answer_url = f"https://{host}/plivo/answer?agent_id={agent_id}&lead_name={quote(lead_name)}&dash_id={dash_id}"
 
+    # FIX (batch status stuck on DIALING): /plivo/hangup exists as a route
+    # in call_handler_app but was never registered as this call's
+    # hangup_url — Plivo only POSTs to it if told to. Without it, nothing
+    # ever wrote hangup_cause promptly; the only path left was the
+    # campaign reconciler's 90s-delayed safety net (see campaigns.py),
+    # which is why status appeared frozen for the whole call and beyond.
+    hangup_url = f"{CALL_HANDLER_URL}/plivo/hangup"
+
     try:
         result = await asyncio.to_thread(
             plivo_client.calls.create,
@@ -234,6 +242,8 @@ async def place_outbound_call(to_number: str, agent_id: str, host: str, lead_nam
             to_=to_number,
             answer_url=answer_url,
             answer_method="POST",
+            hangup_url=hangup_url,
+            hangup_method="POST",
         )
     except Exception as e:
         log.error("outbound call create failed — to=%s agent_id=%s: %s", to_number, agent_id, e)

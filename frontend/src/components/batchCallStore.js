@@ -47,7 +47,7 @@ export function isValidE164(v) { return /^\+[1-9]\d{7,14}$/.test(v) }
 const PHONE_HEADER_CANDIDATES = ['phone', 'phone number', 'number', 'mobile', 'contact', 'to', 'phone_number']
 const NAME_HEADER_CANDIDATES  = ['name', 'lead name', 'customer name', 'contact name']
 
-export const BATCH_STATUSES = { PENDING: 'Pending', FAILED: 'Failed', UNKNOWN: 'Unknown' }
+export const BATCH_STATUSES = { PENDING: 'Pending', FAILED: 'Failed', UNKNOWN: 'Unknown', SKIPPED_DUPLICATE: 'Skipped (duplicate)' }
 // Mirrors campaigns.py's NON_TERMINAL set. A row sitting in any of these
 // business_statuses has NOT actually finished — it just hasn't been
 // re-labeled "Pending" locally (see BUGFIX below).
@@ -191,6 +191,23 @@ export function validateRows() {
   }
   notify()
   return state.preflight
+}
+
+// FIX (duplicates were never actually excluded): validateRows() computed
+// invalidRows/duplicateRows and the pre-flight confirm dialog claimed
+// "these rows will be marked Failed/skipped" — but nothing ever set
+// their status. Invalid numbers happened to get caught anyway by a
+// redundant check inside dialRow(), but duplicates had no such check
+// anywhere, so confirming past the warning still dialed the same number
+// more than once. This marks both sets terminal right after confirm, so
+// nextPendingWave() (which only ever picks PENDING rows) skips them for
+// real — duplicates get their own distinct status so the exported sheet
+// shows *why* a row was skipped, not just a generic failure.
+export function applyPreflightSkips() {
+  if (!state.preflight) return
+  const { invalidRows, duplicateRows } = state.preflight
+  duplicateRows.forEach(i => updateRow(i, { __status: BATCH_STATUSES.SKIPPED_DUPLICATE }))
+  invalidRows.forEach(i => updateRow(i, { __status: BATCH_STATUSES.FAILED }))
 }
 
 function rowsWithStatusColumn() {
@@ -404,7 +421,16 @@ async function fetchAttemptHangupCause(callUuid) {
   }
 }
 
-async function waitForOutcome(callUuid, rowIdx, timeoutMs = 30000) {
+// FIX (concurrency guarantee broken): this used to default to 30000ms —
+// far shorter than a real conversation, which can legitimately run up to
+// the server's own MAX_CALL_DURATION_S hard cap (4:00, see config.py).
+// Any call still genuinely in progress past 30s made this resolve early
+// anyway, letting the wave loop start the NEXT wave of calls while the
+// current ones were still talking to a customer — exactly the opposite
+// of "don't start 3 more until the first 3 have ended." Raised to 5:30,
+// comfortably above the real 4:00 ceiling, so this only ever times out
+// on a genuinely stuck edge case, not a normal long call.
+async function waitForOutcome(callUuid, rowIdx, timeoutMs = 330000) {
   await new Promise((resolve) => {
     let settled = false
     const finish = (cause) => {
@@ -446,7 +472,7 @@ async function waitForOutcome(callUuid, rowIdx, timeoutMs = 30000) {
       if (cause) { finish(cause); return }
       if (settled) return
       settled = true; channel.unsubscribe()
-      setCurrentLog({ row: rowIdx + 1, message: 'Still ringing/in-progress after 30s — moving on, reconciler will catch the outcome', level: 'info' })
+      setCurrentLog({ row: rowIdx + 1, message: 'Still in-progress after 5:30 — moving on, reconciler will catch the outcome', level: 'info' })
       resolve()
     }, timeoutMs)
   })
@@ -528,7 +554,41 @@ export async function startBatch(voiceServerUrl, callHandlerUrl) {
 }
 
 export function pauseBatch() { control.pause = true; state.running = false; notify() }
-export function stopBatch() { control.stopRequested = true; control.pause = false; stopReconcileLoop(); notify() }
+export function stopBatch() {
+  control.stopRequested = true
+  control.pause = false
+  // FIX: this used to kill the reconcile loop unconditionally the
+  // instant Stop was clicked — same bug as the natural-completion path
+  // above, just triggered a different way. Any row already dialed and
+  // still ringing/in-progress on Plivo's side keeps going regardless of
+  // what the dashboard does; killing the poller here meant nothing was
+  // left to ever fetch its real outcome, so it stayed on "DIALING"
+  // forever even after the call itself had long since ended. Stop
+  // should only prevent NEW rows from being dialed — not abandon
+  // tracking of ones already in flight.
+  const stillActive = state.rows.some(r => NON_TERMINAL_STATUSES.has(r.__status))
+  if (!stillActive) stopReconcileLoop()
+  notify()
+}
+
+// FIX (Pause and Stop were functionally identical): both used to just
+// halt the wave loop and let a Resume/Start pick the same rows back up —
+// there was no way to actually walk away from a batch and start clean
+// without reloading the page. This is the genuinely destructive action:
+// halts the loop (same as stopBatch), then wipes the uploaded sheet and
+// campaign link entirely. Any calls already in flight are left alone —
+// this never hangs up a live conversation, same as Pause/Stop — they
+// just won't be tracked in the UI anymore once cleared. Confirmation for
+// this lives in the calling UI component, since it's irreversible.
+export function endBatch() {
+  stopBatch()
+  stopReconcileLoop()
+  state.rows = []; state.columns = []; state.phoneKey = ''; state.nameKey = ''
+  state.fileName = ''; state.fileType = ''
+  state.campaignId = null; state.hasStarted = false; state.preflight = null
+  state.activeIndexes = new Set(); state.currentLog = null
+  notify()
+}
 
 export function exportBatchSheet() {
   if (!state.rows.length) return

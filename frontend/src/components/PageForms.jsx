@@ -21,6 +21,28 @@ const inputStyle = {
 }
 const labelStyle = { fontSize: 11, color: 'var(--text2)', marginBottom: 4, display: 'block' }
 
+// form_submissions has no real FK to calls (no shared unique key), so a
+// PostgREST embed (`select('*, calls(...)')`) isn't possible. Match the
+// most recent call for each submission's to_number in JS instead — same
+// info the UI wants (lead_category / lead_score), just fetched separately.
+async function attachCallInfo(rows) {
+  const numbers = [...new Set(rows.map(r => r.to_number).filter(Boolean))]
+  if (!numbers.length) return rows
+
+  const { data: calls, error } = await supabase
+    .from('calls')
+    .select('to_number, lead_category, lead_score, created_at')
+    .in('to_number', numbers)
+    .order('created_at', { ascending: false })
+  if (error || !calls) return rows
+
+  const latestByNumber = new Map()
+  for (const c of calls) {
+    if (!latestByNumber.has(c.to_number)) latestByNumber.set(c.to_number, c)
+  }
+  return rows.map(r => ({ ...r, calls: latestByNumber.get(r.to_number) || null }))
+}
+
 async function sendFormEmail(to, name, formUrl, { leadId, force } = {}) {
   const res = await fetch(`${API_BASE}/api/send-form-email`, {
     method: 'POST',
@@ -596,7 +618,7 @@ export default function PageForms({ showToast, setFormCount }) {
   }, [])
 
   function buildSubmissionsQuery(withCount) {
-    let q = supabase.from('form_submissions').select('*, calls(lead_category, lead_score)', withCount ? { count: 'exact' } : undefined)
+    let q = supabase.from('form_submissions').select('*', withCount ? { count: 'exact' } : undefined)
     // Most recent submission first — already the default; kept explicit
     // since this is exactly the ordering asked for on the Responses tab.
     return q.order('submitted_at', { ascending: false })
@@ -605,9 +627,9 @@ export default function PageForms({ showToast, setFormCount }) {
   function loadSubmissions() {
     setLoading(true); setFetchError(null)
     const from = page * pageSize, to = from + pageSize - 1
-    buildSubmissionsQuery(true).range(from, to).then(({ data, error, count }) => {
+    buildSubmissionsQuery(true).range(from, to).then(async ({ data, error, count }) => {
       if (error) { console.error('[PageForms]', error.message); setFetchError(error.message) }
-      setSubmissions(data || [])
+      setSubmissions(await attachCallInfo(data || []))
       setTotal(count || 0)
       setLoading(false)
     })

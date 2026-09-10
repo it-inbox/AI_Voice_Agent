@@ -2,7 +2,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from './supabaseClient'
 import Dashboard from './components/Dashboard'
-import Login from './components/Login'
+import Login from './components/login'
 
 export default function App() {
   const [session, setSession] = useState(undefined) // undefined = checking, null = logged out

@@ -95,7 +95,7 @@ export default function PageLeads({ records, loading, openTranscript, showToast,
       .update({ lead_category: newCategory, last_contacted_at: now })
       .eq('call_sid', callSid)
     setStatusSaving(false)
-    if (error) { showToast('Error updating status', 'err'); return }
+    if (error) { showToast(`Error updating status: ${error.message}`, 'err'); console.error('[updateStatus]', error); return }
     showToast(`Status → ${newCategory}`)
     setDetail(d => d ? { ...d, lead_category: newCategory, last_contacted_at: now } : d)
     fetchAll()
@@ -313,7 +313,7 @@ export default function PageLeads({ records, loading, openTranscript, showToast,
                 which will then reveal this button. */}
             {['WARM', 'HOT', 'CLOSED'].includes(detail.lead_category) && (
               <button
-                onClick={async () => { await updateStatus(detail.call_sid, 'CLOSED'); showToast('Deal closed! 🎉') }}
+                onClick={() => updateStatus(detail.call_sid, 'CLOSED')}
                 disabled={detail.lead_category === 'CLOSED' || statusSaving}
                 style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: detail.lead_category === 'CLOSED' ? 'rgba(74,222,128,0.08)' : 'var(--bg3)', border: `0.5px solid ${detail.lead_category === 'CLOSED' ? 'rgba(74,222,128,0.4)' : 'var(--border)'}`, borderRadius: 8, color: detail.lead_category === 'CLOSED' ? '#4ade80' : 'var(--hot)', fontSize: 12, cursor: detail.lead_category === 'CLOSED' ? 'default' : 'pointer', textAlign: 'left', opacity: detail.lead_category === 'CLOSED' ? 0.7 : 1 }}>
                 <Handshake size={13} /> {detail.lead_category === 'CLOSED' ? 'Deal Closed ✓' : 'Close Deal'}

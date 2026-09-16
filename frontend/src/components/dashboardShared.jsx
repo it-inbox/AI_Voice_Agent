@@ -12,23 +12,6 @@ export const GOOGLE_FORM_URL = 'https://docs.google.com/forms/d/e/1FAIpQLSdSOD2W
 // number to an agent) rather than calling Plivo's API directly.
 export const CALL_HANDLER_URL = import.meta.env.VITE_CALL_HANDLER_URL || 'http://localhost:8000'
 
-// NEW — wraps fetch() with the current Supabase session's access token
-// attached as a Bearer header. The Railway backends now require a real,
-// currently-valid dashboard login on every sensitive endpoint (outbound
-// calls, campaigns, Plivo number management, etc.) — this is the one
-// place that attaches it, so every call site just swaps `fetch(url, ...)`
-// for `authedFetch(url, ...)` and gets it automatically. Throws if
-// there's no active session, so callers see a clear error instead of a
-// silent 401 from the backend.
-export async function authedFetch(url, options = {}) {
-  const { data: { session } } = await supabase.auth.getSession()
-  if (!session) throw new Error('Not logged in — please refresh and sign in again.')
-  return fetch(url, {
-    ...options,
-    headers: { ...(options.headers || {}), Authorization: `Bearer ${session.access_token}` },
-  })
-}
-
 // ── DB adapter ────────────────────────────────────────────────
 export function normalizeRow(row) {
   const ex = row.extracted || {}

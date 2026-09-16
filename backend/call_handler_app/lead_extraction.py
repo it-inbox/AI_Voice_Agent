@@ -12,8 +12,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .config import (
+    INTERNAL_API_KEY,
     _get_supabase,
-    check_internal_key as _check_internal_key,
     groq_client,
     logger,
     resolve_agent_id_for_number,
@@ -160,6 +160,12 @@ async def save_live_facts(call_sid: str, facts: Dict[str, Any], outcome: Optiona
 # ═══════════════════════════════════════════════════════════════
 # INGESTION ROUTES
 # ═══════════════════════════════════════════════════════════════
+
+def _check_internal_key(request: Request) -> None:
+    if INTERNAL_API_KEY:
+        provided = request.headers.get("X-Internal-Key", "")
+        if provided != INTERNAL_API_KEY:
+            raise HTTPException(status_code=403, detail="Invalid internal API key")
 
 
 @router.post("/api/call-live-facts")

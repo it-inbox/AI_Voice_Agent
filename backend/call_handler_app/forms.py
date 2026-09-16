@@ -9,12 +9,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import resend
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .config import RESEND_API_KEY, RESEND_FROM_EMAIL, _get_supabase, logger, require_user
+from .config import RESEND_API_KEY, RESEND_FROM_EMAIL, _get_supabase, logger
 
-router = APIRouter(dependencies=[Depends(require_user)])
+router = APIRouter()
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 

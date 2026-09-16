@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import plivo
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .campaigns import NON_TERMINAL
@@ -18,8 +18,6 @@ from .config import (
     PLIVO_APP_NAME,
     PLIVO_AUTH_TOKEN,
     _PHONE_MAP_CACHE,
-    check_internal_key,
-    require_user,
     _get_supabase,
     _with_retry,
     business_status,
@@ -222,8 +220,7 @@ async def _ensure_shared_application() -> str:
 
 
 @router.get("/api/agent-for-number")
-async def agent_for_number(to: str, request: Request):
-    check_internal_key(request)
+async def agent_for_number(to: str):
     await resolve_agent_id_for_number(to)
     agent_id = (
         _PHONE_MAP_CACHE.get(to) or _PHONE_MAP_CACHE.get(f"+{to}") or _PHONE_MAP_CACHE.get(to.lstrip("+"))
@@ -232,8 +229,7 @@ async def agent_for_number(to: str, request: Request):
 
 
 @router.get("/api/number-for-agent")
-async def number_for_agent(agent_id: str, request: Request):
-    check_internal_key(request)
+async def number_for_agent(agent_id: str):
     def _lookup():
         rows = (
             _get_supabase().table("agent_numbers").select("number").eq("agent_id", agent_id).limit(1).execute().data or []
@@ -244,7 +240,7 @@ async def number_for_agent(agent_id: str, request: Request):
 
 
 @router.get("/api/plivo/numbers")
-async def list_plivo_numbers(user=Depends(require_user)):
+async def list_plivo_numbers():
     def _list_all() -> List[Dict[str, Any]]:
         out, offset = [], 0
         while True:
@@ -283,7 +279,7 @@ async def list_plivo_numbers(user=Depends(require_user)):
 
 
 @router.post("/api/plivo/link-number")
-async def link_plivo_number(request: Request, user=Depends(require_user)):
+async def link_plivo_number(request: Request):
     body     = await request.json()
     agent_id = (body.get("agent_id") or "").strip()
     number   = (body.get("number") or "").strip()
@@ -305,7 +301,7 @@ async def link_plivo_number(request: Request, user=Depends(require_user)):
 
 
 @router.post("/api/plivo/unlink-number")
-async def unlink_plivo_number(request: Request, user=Depends(require_user)):
+async def unlink_plivo_number(request: Request):
     body   = await request.json()
     number = (body.get("number") or "").strip()
     if not number:
@@ -318,7 +314,7 @@ async def unlink_plivo_number(request: Request, user=Depends(require_user)):
 
 
 @router.get("/api/plivo/call-status")
-async def plivo_call_status(call_uuid: str, user=Depends(require_user)):
+async def plivo_call_status(call_uuid: str):
     call_uuid = (call_uuid or "").strip()
     if not call_uuid:
         raise HTTPException(status_code=400, detail="call_uuid is required")

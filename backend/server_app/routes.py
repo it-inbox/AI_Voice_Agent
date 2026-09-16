@@ -27,7 +27,7 @@ from .call_handler_client import (
     save_call_result,
     save_call_transcript,
 )
-from .config import CALL_HANDLER_URL, CallOutcome, PLIVO_ANSWER_URL, PLIVO_AUTH_TOKEN, PORT, SEND_QUEUE_MAXSIZE, SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL, log
+from .config import CALL_HANDLER_URL, CallOutcome, PLIVO_ANSWER_URL, PLIVO_AUTH_TOKEN, PORT, SEND_QUEUE_MAXSIZE, log
 from .llm_bridge import on_turn_complete
 from .prompts import build_greeting, build_stt_settings, build_system_prompt
 from .stt_bridge import _stt_close, _stt_connect, amd_max_wait_guard, duration_guard, keepalive_loop, stt_listener_thread
@@ -154,40 +154,12 @@ async def plivo_answer(request: web.Request) -> web.Response:
     return web.Response(text=xml, content_type="application/xml")
 
 
-async def _require_dashboard_user(request: web.Request) -> bool:
-    """aiohttp equivalent of call_handler_app's require_user dependency —
-    verifies the caller sent a real, currently valid Supabase Auth
-    session, same login the dashboard already requires. Returns True on
-    success; on failure the caller should return 401 immediately without
-    running the rest of the handler. Not used on /plivo/answer (Plivo
-    webhook, verified by signature instead) or /ws/plivo (the actual
-    Plivo media stream — Plivo can't send a Supabase session either)."""
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return False
-    token = auth_header[len("Bearer "):].strip()
-    if not token or not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
-        return False
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(
-                f"{SUPABASE_URL}/auth/v1/user",
-                headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_PUBLISHABLE_KEY},
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                return resp.status == 200
-    except Exception:
-        return False
-
-
 async def resolve_call_uuid(request: web.Request) -> web.Response:
     """Fallback resolver — used when the outbound-call response came back
     with call_uuid=null (the answer webhook hadn't fired within the ~6s
     place_outbound_call() waits). The dashboard can keep polling this with
     the dash_id it got back until it resolves, or until it gives up and
     marks the row as never-connected."""
-    if not await _require_dashboard_user(request):
-        return web.json_response({"error": "unauthorized"}, status=401)
     dash_id = request.query.get("dash_id", "")
     if not dash_id:
         return web.json_response({"error": "dash_id is required"}, status=400)
@@ -198,8 +170,6 @@ async def resolve_call_uuid(request: web.Request) -> web.Response:
 
 
 async def outbound_call(request: web.Request) -> web.Response:
-    if not await _require_dashboard_user(request):
-        return web.json_response({"error": "unauthorized"}, status=401)
     try:
         body = await request.json()
     except Exception:

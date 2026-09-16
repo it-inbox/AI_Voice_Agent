@@ -48,6 +48,7 @@ async def fetch_agent_config(agent_id: str = DEFAULT_AGENT_ID, force: bool = Fal
                     async with sess.get(
                         f"{CALL_HANDLER_URL}/api/config",
                         params={"agent_id": agent_id},
+                        headers={"X-Internal-Key": INTERNAL_API_KEY},
                         timeout=aiohttp.ClientTimeout(total=5),
                     ) as resp:
                         if resp.status == 200:
@@ -82,6 +83,7 @@ async def resolve_agent_id(to_number: Optional[str]) -> str:
             async with sess.get(
                 f"{CALL_HANDLER_URL}/api/agent-for-number",
                 params={"to": to_number},
+                headers={"X-Internal-Key": INTERNAL_API_KEY},
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if resp.status == 200:
@@ -108,6 +110,7 @@ async def resolve_agent_for_call(to_number: str) -> Optional[str]:
             async with sess.get(
                 f"{CALL_HANDLER_URL}/api/agent-for-number",
                 params={"to": to_number},
+                headers={"X-Internal-Key": INTERNAL_API_KEY},
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if resp.status == 200:
@@ -204,6 +207,7 @@ async def place_outbound_call(to_number: str, agent_id: str, host: str, lead_nam
             async with sess.get(
                 f"{CALL_HANDLER_URL}/api/number-for-agent",
                 params={"agent_id": agent_id},
+                headers={"X-Internal-Key": INTERNAL_API_KEY},
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 data = await resp.json() if resp.status == 200 else {}

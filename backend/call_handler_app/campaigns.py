@@ -28,12 +28,15 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .config import _get_supabase, _with_retry, business_status, logger, plivo_client
+from .config import _get_supabase, _with_retry, business_status, logger, plivo_client, require_user
 
-router = APIRouter()
+# FIX (backend auth gap): every route in this file is called directly by
+# the logged-in dashboard, never by server_app or a Plivo webhook — safe
+# to gate the whole router at once instead of annotating each route.
+router = APIRouter(dependencies=[Depends(require_user)])
 
 NON_TERMINAL = {"QUEUED", "DIALING", "RINGING", "IN_PROGRESS"}
 

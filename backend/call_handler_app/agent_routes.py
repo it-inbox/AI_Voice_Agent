@@ -8,10 +8,10 @@ import os
 from datetime import datetime
 from typing import Dict, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
-from .config import DEFAULT_AGENT_ID, _get_supabase, _with_retry, get_agent_config
+from .config import DEFAULT_AGENT_ID, _get_supabase, _with_retry, check_internal_key, get_agent_config, require_user
 
 router = APIRouter()
 
@@ -25,7 +25,11 @@ def _fetch_agent_profile_sync(agent_id: str) -> Dict[str, Optional[str]]:
 
 
 @router.get("/api/config")
-async def get_config(agent_id: str = DEFAULT_AGENT_ID):
+async def get_config(request: Request, agent_id: str = DEFAULT_AGENT_ID):
+    # Internal-key, not user auth: server_app is the only real caller of
+    # this (fetches live agent config mid-call) — no end-user session
+    # exists in that hop to check.
+    check_internal_key(request)
     cfg     = await get_agent_config(agent_id)
     profile = await asyncio.to_thread(_fetch_agent_profile_sync, agent_id)
     safe_keys = {"system_prompt", "company_name", "calendly_link", "followup_delay", "notification_email", "lead_name"}
@@ -41,7 +45,7 @@ async def get_config(agent_id: str = DEFAULT_AGENT_ID):
 
 
 @router.patch("/api/agents/{agent_id}/toggle")
-async def toggle_agent(agent_id: str, request: Request):
+async def toggle_agent(agent_id: str, request: Request, user=Depends(require_user)):
     body      = await request.json()
     is_active = bool(body.get("is_active"))
     def _update():
@@ -51,7 +55,7 @@ async def toggle_agent(agent_id: str, request: Request):
 
 
 @router.get("/api/agents/active-count")
-async def active_agent_count():
+async def active_agent_count(user=Depends(require_user)):
     def _counts():
         total  = _get_supabase().table("agents").select("agent_id", count="exact").execute()
         active = _get_supabase().table("agents").select("agent_id", count="exact").eq("is_active", True).execute()

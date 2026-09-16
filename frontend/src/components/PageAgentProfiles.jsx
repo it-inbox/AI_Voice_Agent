@@ -3,7 +3,7 @@ import { useEffect, useState, useRef } from 'react'
 import { PhoneCall, Plus, Trash2, Save, Play, Pause, Square, ArrowRight, Download, RefreshCw, Sparkles } from 'lucide-react'
 import { supabase } from '../supabaseClient'
 import styles from './Dashboard.module.css'
-import { CALL_HANDLER_URL } from './dashboardShared'
+import { CALL_HANDLER_URL, authedFetch } from './dashboardShared'
 
 // Batch calling state/loop lives in ./batchCallStore (module-level,
 // survives page navigation). This component only renders `batch`
@@ -137,7 +137,7 @@ export default function PageAgentProfiles({ showToast }) {
     setPlivoLoading(true)
     setPlivoError('')
     try {
-      const res = await fetch(`${CALL_HANDLER_URL}/api/plivo/numbers`)
+      const res = await authedFetch(`${CALL_HANDLER_URL}/api/plivo/numbers`)
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Failed to fetch numbers')
       setPlivoNumbers(data.numbers || [])
@@ -153,7 +153,7 @@ export default function PageAgentProfiles({ showToast }) {
     if (!selectedId) return
     setLinkingNumber(number)
     try {
-      const res = await fetch(`${CALL_HANDLER_URL}/api/plivo/link-number`, {
+      const res = await authedFetch(`${CALL_HANDLER_URL}/api/plivo/link-number`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agent_id: selectedId, number, region }),
@@ -171,7 +171,7 @@ export default function PageAgentProfiles({ showToast }) {
   async function unlinkNumber(number) {
     setLinkingNumber(number)
     try {
-      const res = await fetch(`${CALL_HANDLER_URL}/api/plivo/unlink-number`, {
+      const res = await authedFetch(`${CALL_HANDLER_URL}/api/plivo/unlink-number`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ number }),
@@ -191,7 +191,7 @@ export default function PageAgentProfiles({ showToast }) {
 
   async function loadActiveCount() {
     try {
-      const res = await fetch(`${CALL_HANDLER_URL}/api/agents/active-count`)
+      const res = await authedFetch(`${CALL_HANDLER_URL}/api/agents/active-count`)
       const data = await res.json()
       if (res.ok) setActiveCount(data)
     } catch (e) {
@@ -205,7 +205,7 @@ export default function PageAgentProfiles({ showToast }) {
     if (!selectedId) return
     setTogglingActive(true)
     try {
-      const res = await fetch(`${CALL_HANDLER_URL}/api/agents/${selectedId}/toggle`, {
+      const res = await authedFetch(`${CALL_HANDLER_URL}/api/agents/${selectedId}/toggle`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ is_active: nextValue }),
@@ -462,7 +462,7 @@ export default function PageAgentProfiles({ showToast }) {
     setCallStatus({ status: 'dialing', message: `Dialing ${to} via ${agentLabel}${dialName.trim() ? ` (${dialName.trim()})` : ''}…`, time: new Date() })
 
     try {
-      const res = await fetch(`${VOICE_SERVER_URL}/api/outbound-call`, {
+      const res = await authedFetch(`${VOICE_SERVER_URL}/api/outbound-call`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ to, agent_id: dialAgentId, name: dialName.trim() }),

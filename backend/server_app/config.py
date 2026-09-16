@@ -70,6 +70,16 @@ GROQ_API_KEY      = os.getenv("GROQ_API_KEY") or ""
 GROQ_MODEL        = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 CALL_HANDLER_URL  = os.getenv("CALL_HANDLER_URL", "http://localhost:8000").rstrip("/")
+
+# NEW — for verifying the dashboard's Supabase session on the two
+# routes here a browser calls directly (outbound-call, resolve-call-uuid).
+# server_app has no other Supabase dependency, so this is a plain HTTP
+# call to Supabase's own Auth server rather than pulling in supabase-py
+# just for this. Any valid Supabase API key works for this endpoint —
+# using the same publishable key the frontend already uses, not the
+# service-role key, since this call needs no elevated privilege.
+SUPABASE_URL            = os.getenv("SUPABASE_URL", "")
+SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 PORT              = int(os.getenv("PORT", "5002"))
 PLIVO_AUTH_ID     = os.getenv("PLIVO_AUTH_ID", "")
 PLIVO_AUTH_TOKEN  = os.getenv("PLIVO_AUTH_TOKEN", "")

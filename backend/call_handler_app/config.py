@@ -17,6 +17,7 @@ import httpx
 import plivo
 import resend
 from dotenv import load_dotenv
+from fastapi import Request
 from groq import AsyncGroq
 from supabase import create_client, Client
 
@@ -42,6 +43,21 @@ PLIVO_AUTH_TOKEN          = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_ANSWER_URL          = os.getenv("PLIVO_ANSWER_URL", "")
 PLIVO_APP_NAME            = os.getenv("PLIVO_APP_NAME", "ai-voice-agent")
 INTERNAL_API_KEY          = os.getenv("INTERNAL_API_KEY", "")
+
+
+def check_internal_key(request) -> None:
+    """Shared by any route only ever meant to be called server-to-server
+    (server_app -> call_handler_app), never directly by a browser.
+    FIX (fail-open -> fail-closed): an unset/empty INTERNAL_API_KEY used
+    to mean "skip this check" in the old per-file version of this
+    function — a misconfigured deployment silently ran with no internal
+    auth at all instead of failing loudly. Now always rejects when the
+    key isn't configured."""
+    from fastapi import HTTPException
+    if not INTERNAL_API_KEY:
+        raise HTTPException(status_code=500, detail="Server misconfigured: INTERNAL_API_KEY not set")
+    if request.headers.get("X-Internal-Key", "") != INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid internal API key")
 RESEND_API_KEY            = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL         = os.getenv("RESEND_FROM_EMAIL", "Inbox Infotech <onboarding@resend.dev>")
 ALLOWED_ORIGINS           = [
@@ -83,6 +99,37 @@ def _get_supabase() -> Client:
     if supabase is None:
         raise RuntimeError("Supabase client not initialised yet")
     return supabase
+
+
+async def require_user(request: Request):
+    """FastAPI dependency: verifies the caller sent a real, currently
+    valid Supabase Auth session (the same login the dashboard already
+    requires), not just a raw HTTP request to the Railway URL. Add
+    `Depends(require_user)` to any route the browser calls directly on
+    behalf of a logged-in dashboard user. Do NOT use this on: Plivo
+    webhooks (verified by Plivo signature instead — Plivo can't send a
+    Supabase session), or server-to-server calls between server_app and
+    call_handler_app (use check_internal_key instead — there's no
+    end-user session in that hop at all)."""
+    # FIX (422 on every protected route): `request` had no type
+    # annotation, so FastAPI couldn't tell this was meant to be the
+    # special injected Request object — it silently treated it as a
+    # required QUERY PARAMETER named "request" instead, and rejected
+    # every call that didn't have ?request=... in the URL with a 422.
+    from fastapi import HTTPException
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = auth_header[len("Bearer "):].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    try:
+        result = await asyncio.to_thread(_get_supabase().auth.get_user, token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    if not result or not result.user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return result.user
 
 
 def _with_retry(fn, *args, retries: int = 2, delay: float = 0.15, **kwargs):

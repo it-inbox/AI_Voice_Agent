@@ -313,6 +313,21 @@ async def unlink_plivo_number(request: Request):
     return JSONResponse({"status": "ok", "number": number})
 
 
+def _single_call_display_status(call_status: Optional[str], hangup_cause: Optional[str]) -> str:
+    """Friendly status for a single/manual dashboard call only — kept
+    separate from business_status() above (that one's for bulk campaign
+    attempts) per the ask to touch only single-call display."""
+    cs = (call_status or "").lower()
+    hc = (hangup_cause or "").lower()
+    if cs == "queued":
+        return "Call placed"
+    if cs in ("ringing", "in-progress"):
+        return "Ongoing"
+    if cs == "busy" or "reject" in hc or "declin" in hc or "busy" in hc:
+        return "Rejected"
+    return "Ended"   # completed / failed / no-answer / canceled / anything else terminal
+
+
 @router.get("/api/plivo/call-status")
 async def plivo_call_status(call_uuid: str):
     call_uuid = (call_uuid or "").strip()
@@ -323,9 +338,9 @@ async def plivo_call_status(call_uuid: str):
     try:
         call = await asyncio.wait_for(asyncio.to_thread(_with_retry, _get), timeout=12)
     except asyncio.TimeoutError:
-        return JSONResponse({"status": "timeout", "call_uuid": call_uuid})
+        return JSONResponse({"status": "timeout", "call_uuid": call_uuid, "display_status": "Ongoing"})
     except Exception as e:
-        return JSONResponse({"status": "not_found", "call_uuid": call_uuid, "detail": str(e)})
+        return JSONResponse({"status": "not_found", "call_uuid": call_uuid, "detail": str(e), "display_status": "Ended"})
     call_status  = getattr(call, "call_status", None) or (call.get("call_status") if isinstance(call, dict) else None)
     end_time     = getattr(call, "end_time", None) or (call.get("end_time") if isinstance(call, dict) else None)
     hangup_cause = (
@@ -333,4 +348,8 @@ async def plivo_call_status(call_uuid: str):
         or (call.get("hangup_cause_name") if isinstance(call, dict) else None)
         or (call.get("hangup_cause") if isinstance(call, dict) else None)
     )
-    return JSONResponse({"status": "ok", "call_uuid": call_uuid, "call_status": call_status, "end_time": end_time, "hangup_cause": hangup_cause})
+    return JSONResponse({
+        "status": "ok", "call_uuid": call_uuid, "call_status": call_status,
+        "end_time": end_time, "hangup_cause": hangup_cause,
+        "display_status": _single_call_display_status(call_status, hangup_cause),   # NEW
+    })

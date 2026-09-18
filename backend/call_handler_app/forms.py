@@ -9,12 +9,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import resend
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .config import RESEND_API_KEY, RESEND_FROM_EMAIL, _get_supabase, logger
+from .config import RESEND_API_KEY, RESEND_FROM_EMAIL, _get_supabase, logger, rate_limit, require_user
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
@@ -87,7 +87,8 @@ def _recent_duplicate_send(to_email: str, form_url: str) -> bool:
 
 
 @router.post("/api/send-form-email")
-async def send_form_email_route(request: Request):
+async def send_form_email_route(request: Request, user=Depends(require_user)):
+    rate_limit(f"form_email:{user.id}", max_calls=15, window_s=60)
     body     = await request.json()
     to_email = (body.get("lead_email") or "").strip().lower()
     name     = (body.get("lead_name") or "").strip()

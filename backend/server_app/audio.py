@@ -36,6 +36,11 @@ from .tts_bridge import send_to_tts   # NEW — "are you there?" ghost-call prom
 # trip it.
 MISSED_INTERRUPTION_WINDOW_S = 0.6
 
+# NEW — see _check_ghost_call's FIX comment: how long rms must stay above
+# SILENCE_THRESHOLD before it's trusted as real caller speech resetting
+# the ghost-call timer, instead of a single-frame echo/click blip.
+GHOST_RESET_SUSTAIN_S = 0.15
+
 
 def _build_ulaw_table() -> List[int]:
     table = []
@@ -134,6 +139,22 @@ def _start_media_sender(s: Session) -> None:
     ).start()
 
 
+_MULAW_BYTES_PER_SEC = 8000.0   # 8kHz, 8-bit mulaw = 1 byte/sample, mono
+# NEW — how far ahead of real playback time we're allowed to hand chunks
+# to Plivo before pacing kicks in and we wait. Deepgram's Speak socket can
+# emit several chunks back-to-back faster than they take to actually play
+# (generation is faster than real-time) — with no pacing, audio_sender_task
+# used to forward every chunk to Plivo the instant it left the queue, so a
+# burst of chunks landed on Plivo's own jitter buffer all at once instead
+# of at the cadence Plivo expects a live mulaw stream to arrive at. That
+# mismatch is a plausible source of the "your voice is cracking" reports —
+# audio content/encoding itself checks out (mulaw/8kHz end-to-end, matches
+# Plivo's expected format), so this targets DELIVERY TIMING specifically.
+# A small lead is still allowed (not fully lockstep) so a brief scheduling
+# jitter on our side doesn't itself introduce a gap.
+_PACE_MAX_LEAD_S = 0.10
+
+
 async def audio_sender_task(ws: web.WebSocketResponse, s: Session) -> None:
     try:
         while True:
@@ -143,8 +164,27 @@ async def audio_sender_task(ws: web.WebSocketResponse, s: Session) -> None:
             gen_id, audio = item
             is_current = gen_id == s.generation_id
             metrics.record_tts_chunk(s.call_sid, is_stale=not is_current)   # NEW — item 3: stale-response rate
-            if is_current:
-                await send_audio_to_plivo(ws, audio, s.stream_sid)
+            if not is_current:
+                continue   # cancelled turn's audio — drop, don't let it affect pacing either
+
+            # NEW — pace delivery to roughly real-time instead of bursting
+            # every queued chunk to Plivo as fast as it's decoded. A new
+            # generation (fresh turn, or resumption after a barge-in) always
+            # sends its first chunk immediately — no inherited delay from
+            # whatever schedule the previous (now-cancelled) turn was on.
+            now = time.monotonic()
+            if s._pace_gen != gen_id:
+                s._pace_gen      = gen_id
+                s._pace_next_ts  = now
+            elif s._pace_next_ts is not None and s._pace_next_ts - now > _PACE_MAX_LEAD_S:
+                await asyncio.sleep(s._pace_next_ts - now - _PACE_MAX_LEAD_S)
+                now = time.monotonic()
+
+            await send_audio_to_plivo(ws, audio, s.stream_sid)
+
+            chunk_dur = len(audio) / _MULAW_BYTES_PER_SEC
+            base = s._pace_next_ts if (s._pace_next_ts and s._pace_next_ts > now) else now
+            s._pace_next_ts = base + chunk_dur
     except asyncio.CancelledError:
         pass
 
@@ -276,6 +316,8 @@ def _check_ghost_call(ws: web.WebSocketResponse, s: Session, rms: float, loop: a
     if s.ghost_fired:
         return
     if rms < SILENCE_THRESHOLD:
+        with s.lock:
+            s._ghost_reset_onset_ts = None   # any real dip below threshold cancels a pending reset
         should_prompt = False
         should_hangup = False
         with s.lock:
@@ -291,12 +333,34 @@ def _check_ghost_call(ws: web.WebSocketResponse, s: Session, rms: float, loop: a
         elif should_hangup:
             run_async(ghost_call_hangup(ws, s), loop)
     else:
-        # Real caller audio — they're there. Reset both the timer and the
-        # "already asked" flag so a LATER silence gap gets its own fresh
-        # "are you there?" prompt instead of going straight to hangup.
+        # FIX (bug: two "are you still there?" prompts back to back with
+        # dead air in between, no real reply heard): this used to reset
+        # BOTH silence_seconds and ghost_prompted on a SINGLE frame
+        # (FRAME_DURATION_S = 20ms) of rms >= threshold. With no acoustic
+        # echo cancellation anywhere in this pipeline (a known, documented
+        # limitation — see stt_bridge.py's barge-in debounce comments), a
+        # single click/line-noise/echo blip right after the agent stops
+        # talking was enough to silently reset ghost_prompted — then real
+        # silence resumed and, ~GHOST_CALL_WARNING_S later, fired a SECOND
+        # "are you there?" prompt with nothing in between but dead air,
+        # reading exactly like the agent going quiet for a long stretch.
+        # Real caller speech is sustained over multiple frames; a blip
+        # isn't. Require GHOST_RESET_SUSTAIN_S of continuous energy before
+        # actually resetting — same "confirm before committing" shape as
+        # the barge-in debounce elsewhere in this codebase, applied here
+        # to the reset side instead of the interrupt side.
         with s.lock:
-            s.silence_seconds = 0.0
-            s.ghost_prompted  = False
+            onset = s._ghost_reset_onset_ts
+            now   = time.monotonic()
+            if onset is None:
+                s._ghost_reset_onset_ts = now
+                sustained = False
+            else:
+                sustained = (now - onset) >= GHOST_RESET_SUSTAIN_S
+            if sustained:
+                s.silence_seconds = 0.0
+                s.ghost_prompted  = False
+                s._ghost_reset_onset_ts = None
 
 
 def _check_amd(ws: web.WebSocketResponse, s: Session, rms: float, loop: asyncio.AbstractEventLoop) -> None:

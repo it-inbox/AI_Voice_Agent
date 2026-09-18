@@ -91,6 +91,16 @@ _MAX_SENTENCE_BUF_CHARS = 220  # safety cap — force a flush rather than
                                # (or the model just not using terminal
                                # punctuation) hold the whole reply hostage
 
+# NEW (latency, item 3) — waiting for the model's first FULL sentence
+# before speaking anything adds dead air on every turn, worst right after
+# a barge-in recovery where the caller is already listening for a
+# response. A real phone agent doesn't wait for a whole sentence to react
+# either — "So," / "Right," / a short clause lands, then the rest
+# follows. Only applies to the very first chunk of a turn: once
+# first_chunk_sent is True, normal full-sentence flushing (via
+# _is_real_sentence_end) resumes for the rest of the reply.
+_FIRST_CHUNK_MIN_CHARS = 30
+
 
 def _is_real_sentence_end(buf: str) -> bool:
     stripped = buf.rstrip()
@@ -251,6 +261,27 @@ async def on_turn_complete(s: Session, ws: web.WebSocketResponse, user_text: str
     call_sid = s.call_sid
     messages = _build_messages(s)
 
+    # NEW (hardening, item 2 — "never respond to an outdated STT result"):
+    # task.cancel() is the primary interruption mechanism and normally
+    # delivers CancelledError at the very next await, but asyncio.to_thread
+    # work already handed to the thread pool (send_to_tts's conn.send_text/
+    # send_flush calls) keeps running in the background even after the
+    # awaiting task is cancelled — a narrow window where a stale sentence
+    # could still reach TTS a beat after a barge-in bumped the generation.
+    # Capture this turn's own generation id and re-check it at every point
+    # this coroutine is about to speak or start another hop, independent
+    # of whether cancellation has (or hasn't) been delivered yet. A stale
+    # check `return`s immediately — same as a real CancelledError: no
+    # history append, no tail (agent_speaking reset / hangup check). This
+    # is a second, explicit guard on top of task.cancel(), not a
+    # replacement for it.
+    with s.lock:
+        my_gen = s.generation_id
+
+    def _stale() -> bool:
+        with s.lock:
+            return s.generation_id != my_gen
+
     # FIX (ghost-call hanging up right after the agent finishes talking):
     # `_should_analyze()` in audio.py gates ALL ghost-call/AMD silence
     # accumulation behind `not s.agent_speaking` — but this flag was only
@@ -301,12 +332,16 @@ async def on_turn_complete(s: Session, ws: web.WebSocketResponse, user_text: str
     # — and re-arming ghost-call silence detection + barge-in debounce —
     # while the agent can still be audibly mid-sentence.
     total_spoken_text = ""
+    first_chunk_sent  = False   # NEW (item 3) — see _FIRST_CHUNK_MIN_CHARS above
     looped_out = True   # NEW — becomes False the instant we hit a normal
                          # (non-tool-call) hop exit, whether or not that
                          # hop actually had anything to say. See the FIX
                          # below for why this distinction matters.
 
     for hop in range(_MAX_TOOL_HOPS):
+        if _stale():   # NEW — a barge-in landed while handle_fn() ran between hops
+            clog(call_sid, f"turn superseded (gen changed) — aborting before hop {hop}")
+            return
         stream = None
         for retry in range(2):   # NEW — one retry for transient 429s only; not a fix for the TPM ceiling itself
             try:
@@ -356,6 +391,9 @@ async def on_turn_complete(s: Session, ws: web.WebSocketResponse, user_text: str
         tool_calls_acc: Dict[int, Dict[str, Any]] = {}
 
         async for chunk in stream:
+            if _stale():   # NEW — see _stale() docstring above
+                clog(call_sid, "turn superseded (gen changed) mid-stream — aborting silently")
+                return
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -374,10 +412,14 @@ async def on_turn_complete(s: Session, ws: web.WebSocketResponse, user_text: str
             if delta.content:
                 sentence_buf += delta.content
                 turn_text    += delta.content
-                if _is_real_sentence_end(sentence_buf):
+                ready = _is_real_sentence_end(sentence_buf)
+                if not ready and not first_chunk_sent and len(sentence_buf) >= _FIRST_CHUNK_MIN_CHARS and sentence_buf.rstrip().endswith(","):
+                    ready = True   # NEW (item 3) — short first clause, don't wait for the full sentence
+                if ready:
                     await send_to_tts(s, sentence_buf)     # stream sentence-by-sentence, don't wait for full completion
                     total_spoken_text += sentence_buf
-                    sentence_buf = ""
+                    sentence_buf     = ""
+                    first_chunk_sent = True
 
         if tool_calls_acc:
             # Any partial trailing sentence before the tool call isn't
@@ -407,6 +449,10 @@ async def on_turn_complete(s: Session, ws: web.WebSocketResponse, user_text: str
                 })
             # loop again — model needs another completion call to react to the tool result(s)
             continue
+
+        if _stale():   # NEW — see _stale() docstring above
+            clog(call_sid, "turn superseded (gen changed) at stream end — aborting silently")
+            return
 
         # No tool calls this hop — flush any trailing partial sentence and stop.
         if sentence_buf.strip():

@@ -28,12 +28,15 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .config import _get_supabase, _with_retry, business_status, logger, plivo_client
+from .config import _get_supabase, _with_retry, business_status, logger, plivo_client, rate_limit, require_user
 
-router = APIRouter()
+# FIX (backend auth gap): every route in this file is called directly by
+# the logged-in dashboard, never by server_app or a Plivo webhook — safe
+# to gate the whole router at once instead of annotating each route.
+router = APIRouter(dependencies=[Depends(require_user)])
 
 NON_TERMINAL = {"QUEUED", "DIALING", "RINGING", "IN_PROGRESS"}
 
@@ -207,13 +210,14 @@ async def get_campaign_leads(campaign_id: str):
 
 
 @router.post("/api/campaigns/{campaign_id}/dial/{lead_id}")
-async def dial_lead(campaign_id: str, lead_id: str):
+async def dial_lead(campaign_id: str, lead_id: str, user=Depends(require_user)):
     """ATOMIC claim — the fix for duplicate-call risk (see module
     docstring). Only the caller that wins the DB-level claim is told
     reused=False; that's the ONLY caller allowed to proceed to
     server.py's /api/outbound-call and actually invoke Plivo. Every
     other caller — a second tab, a retried request, a resume after
     refresh — gets reused=True and the winner's row, and must NOT dial."""
+    rate_limit(f"dial:{user.id}", max_calls=20, window_s=60)
     def _get_lead():
         return _get_supabase().table("campaign_leads").select("*").eq("lead_id", lead_id).single().execute().data
     lead = await asyncio.to_thread(_with_retry, _get_lead)

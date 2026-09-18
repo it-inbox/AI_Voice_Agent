@@ -132,6 +132,28 @@ async def require_user(request: Request):
     return result.user
 
 
+# NEW — rate limiting for paid/costly operations (outbound calls, batch
+# dial, Plivo number mgmt, form email). In-memory only: fine for a
+# single Railway instance (your current setup); would need a shared
+# store (Redis) if this ever runs multiple instances, since each
+# instance would count independently otherwise.
+_rate_limit_hits: Dict[str, list] = {}
+
+
+def rate_limit(key: str, max_calls: int, window_s: float) -> None:
+    """Call at the top of a route body (after require_user/
+    check_internal_key). Raises 429 if `key` (usually the user's id,
+    scoped per-endpoint) has exceeded max_calls within the last
+    window_s seconds."""
+    from fastapi import HTTPException
+    now = time.time()
+    hits = [t for t in _rate_limit_hits.get(key, []) if now - t < window_s]
+    if len(hits) >= max_calls:
+        raise HTTPException(status_code=429, detail="Too many requests — slow down and try again shortly.")
+    hits.append(now)
+    _rate_limit_hits[key] = hits
+
+
 def _with_retry(fn, *args, retries: int = 2, delay: float = 0.15, **kwargs):
     last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):

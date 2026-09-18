@@ -75,6 +75,8 @@ PLIVO_AUTH_ID     = os.getenv("PLIVO_AUTH_ID", "")
 PLIVO_AUTH_TOKEN  = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_ANSWER_URL  = os.getenv("PLIVO_ANSWER_URL", "")
 INTERNAL_API_KEY  = os.getenv("INTERNAL_API_KEY", "")  # shared secret for calling call_handler.py
+SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY")
+SUPABASE_URL      = os.getenv("SUPABASE_URL")
 
 if not DEEPGRAM_API_KEY:
     raise ValueError("DEEPGRAM_API_KEY missing")

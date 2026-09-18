@@ -39,6 +39,12 @@ class Session:
         # final), used by _handle_barge_in_stop to poll for ongoing
         # speech instead of a single fixed wait.
         "last_stt_activity_at",
+        # NEW — dedupe guard (live report: same customer line got two
+        # different worded replies back to back — Deepgram can emit a
+        # speech_final Results AND a following UtteranceEnd carrying the
+        # same already-processed text; both paths used to launch their
+        # own turn). See stt_bridge.py's dedupe check.
+        "last_finalized_text", "last_finalized_at",
         # NEW — barge-in improvements:
         # active_llm_task: handle to the in-flight Groq stream so barge-in
         #   can cancel it immediately instead of letting it keep running
@@ -54,10 +60,29 @@ class Session:
         #   Deepgram never fired SpeechStarted at all.
         "active_llm_task", "tts_send_gen", "tts_flushed_event",
         "_local_speech_onset_ts", "_barge_in_detect_ts", "_missed_flagged",
+        # NEW — outbound audio pacing (see audio.py audio_sender_task).
+        # _pace_next_ts: monotonic time the next chunk is allowed to go
+        #   out; _pace_gen: the generation that schedule belongs to, so a
+        #   barge-in/new-turn resets pacing instead of inheriting a stale
+        #   delay from audio that's already been cancelled.
+        "_pace_next_ts", "_pace_gen",
+        # NEW — require sustained energy before treating it as real caller
+        # audio for ghost-call purposes (see _check_ghost_call in audio.py).
+        "_ghost_reset_onset_ts",
         "silence_seconds", "ghost_fired", "ghost_prompted",
         "call_type", "amd_speech_start", "amd_done",
         "call_state",
         "pending_hangup",
+        # NEW — the independent hangup-scheduling task spawned by
+        # _hangup_if_pending (llm_bridge.py). Lets a genuine correction
+        # during the goodbye cancel just the scheduled hangup, without
+        # having to blanket-ignore everything the caller says while
+        # pending_hangup is set (see stt_bridge.py's call_ending handling).
+        "pending_hangup_task",
+        # NEW — dedicated email-capture flow state (stt_bridge.py). Kept
+        # separate from s.facts (which is "confirmed knowledge") — these
+        # two are working state for the in-progress capture itself.
+        "email_capture_buffer", "email_capture_pending",
         "outcome",
         "call_start_time", "warning_sent",
         "history", "facts",
@@ -96,6 +121,8 @@ class Session:
         # quiet" instead of guessing a single fixed timeout for every
         # interruption length.
         self.last_stt_activity_at = None
+        self.last_finalized_text: str = ""
+        self.last_finalized_at:   float = 0.0
         self.generation_id   = 0
         self.active_llm_task = None
         self.tts_send_gen    = 0
@@ -103,6 +130,9 @@ class Session:
         self._local_speech_onset_ts: Optional[float] = None
         self._barge_in_detect_ts: Optional[float] = None
         self._missed_flagged = False
+        self._pace_next_ts: Optional[float] = None
+        self._pace_gen      = -1
+        self._ghost_reset_onset_ts: Optional[float] = None
         self.silence_seconds = 0.0
         self.ghost_fired     = False
         self.ghost_prompted  = False   # NEW — "are you there?" already spoken this silence window
@@ -111,6 +141,9 @@ class Session:
         self.amd_done        = False
         self.call_state      = CallState.VERIFY_IDENTITY
         self.pending_hangup  = False
+        self.pending_hangup_task: Optional[asyncio.Task] = None
+        self.email_capture_buffer:  str = ""
+        self.email_capture_pending: Optional[str] = None
         self.outcome: Optional[str] = None
         self.call_start_time: Optional[float] = None
         self.warning_sent    = False
@@ -119,6 +152,22 @@ class Session:
             "lead_name": None, "company": None,
             "budget": None,    "timeline": None,
             "pain_points": [], "interested_services": [],
+            # NEW — root cause of a live-call report: the caller answers
+            # "no website" / "yes I'm the decision maker" early, the call
+            # drags on (off-topic tangents, "repeat that", etc.), those
+            # turns scroll the real answer out of the sliding history
+            # window (llm_bridge._HISTORY_WINDOW_MESSAGES), and — because
+            # there was never a durable-facts slot for it, unlike
+            # company/budget/timeline — the model has no memory left that
+            # it was already answered and asks again.
+            "has_website": None, "is_decision_maker": None,
+            # NEW — email capture state (see stt_bridge.py's
+            # _EMAIL_CAPTURE_* functions). "email" is set ONLY by the
+            # deterministic capture flow once the caller confirms it back —
+            # never by the LLM directly — so what's stored is what a
+            # human actually confirmed, not a model guess/hallucination
+            # of a spelled-out address.
+            "email": None, "wants_email_capture": False,
         }
         self.stt_settings: Dict = {}
         self.system_prompt: str = ""

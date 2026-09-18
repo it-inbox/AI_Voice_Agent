@@ -27,7 +27,7 @@ from .call_handler_client import (
     save_call_result,
     save_call_transcript,
 )
-from .config import CALL_HANDLER_URL, CallOutcome, PLIVO_ANSWER_URL, PLIVO_AUTH_TOKEN, PORT, SEND_QUEUE_MAXSIZE, log
+from .config import CALL_HANDLER_URL, CallOutcome, PLIVO_ANSWER_URL, PLIVO_AUTH_TOKEN, PORT, SEND_QUEUE_MAXSIZE, SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL, log
 from .llm_bridge import on_turn_complete
 from .prompts import build_greeting, build_stt_settings, build_system_prompt
 from .stt_bridge import _stt_close, _stt_connect, amd_max_wait_guard, duration_guard, keepalive_loop, stt_listener_thread
@@ -154,12 +154,61 @@ async def plivo_answer(request: web.Request) -> web.Response:
     return web.Response(text=xml, content_type="application/xml")
 
 
+async def _require_dashboard_user(request: web.Request):
+    """aiohttp equivalent of call_handler_app's require_user dependency —
+    verifies the caller sent a real, currently valid Supabase Auth
+    session, same login the dashboard already requires. Returns the
+    user's id string on success, None on failure — the id doubles as the
+    rate-limit key for outbound_call below. Not used on /plivo/answer
+    (Plivo webhook, verified by signature instead) or /ws/plivo (the
+    actual Plivo media stream — Plivo can't send a Supabase session
+    either)."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[len("Bearer "):].strip()
+    if not token or not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_PUBLISHABLE_KEY},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                return data.get("id")
+    except Exception:
+        return None
+
+
+# NEW — same in-memory rate-limit pattern as call_handler_app's
+# config.py (see that file for the shared-instance caveat). Separate
+# dict here since this is a different process.
+_rate_limit_hits: Dict[str, list] = {}
+
+
+def _rate_limit(key: str, max_calls: int, window_s: float) -> bool:
+    """Returns True if the call is allowed, False if the limit was hit."""
+    now = time.time()
+    hits = [t for t in _rate_limit_hits.get(key, []) if now - t < window_s]
+    if len(hits) >= max_calls:
+        return False
+    hits.append(now)
+    _rate_limit_hits[key] = hits
+    return True
+
+
 async def resolve_call_uuid(request: web.Request) -> web.Response:
     """Fallback resolver — used when the outbound-call response came back
     with call_uuid=null (the answer webhook hadn't fired within the ~6s
     place_outbound_call() waits). The dashboard can keep polling this with
     the dash_id it got back until it resolves, or until it gives up and
     marks the row as never-connected."""
+    if not await _require_dashboard_user(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
     dash_id = request.query.get("dash_id", "")
     if not dash_id:
         return web.json_response({"error": "dash_id is required"}, status=400)
@@ -170,6 +219,15 @@ async def resolve_call_uuid(request: web.Request) -> web.Response:
 
 
 async def outbound_call(request: web.Request) -> web.Response:
+    user_id = await _require_dashboard_user(request)
+    if not user_id:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    # NEW — this is THE most sensitive endpoint in the app: it places a
+    # real, billed phone call. 30/minute comfortably covers legitimate
+    # use (batch dialing runs 3 concurrent, one call each — nowhere near
+    # this) while stopping a runaway loop or bug from placing hundreds.
+    if not _rate_limit(f"outbound_call:{user_id}", max_calls=30, window_s=60):
+        return web.json_response({"error": "Too many requests — slow down and try again shortly."}, status=429)
     try:
         body = await request.json()
     except Exception:

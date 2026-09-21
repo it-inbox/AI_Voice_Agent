@@ -21,6 +21,7 @@ Everything else in server_app/ imports config for these.
 
 import logging
 import os
+import httpx
 from enum import Enum
 from typing import Dict, List
 
@@ -71,12 +72,18 @@ GROQ_MODEL        = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 CALL_HANDLER_URL  = os.getenv("CALL_HANDLER_URL", "http://localhost:8000").rstrip("/")
 PORT              = int(os.getenv("PORT", "5002"))
+
+# NEW — browser-facing endpoints here (outbound_call, resolve_call_uuid)
+# need the same Supabase-session check call_handler_app already enforces
+# (see require_user below) — this service was missing it entirely, a
+# real, separate gap from the frontend-side fix (both were needed).
+SUPABASE_URL              = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+
 PLIVO_AUTH_ID     = os.getenv("PLIVO_AUTH_ID", "")
 PLIVO_AUTH_TOKEN  = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_ANSWER_URL  = os.getenv("PLIVO_ANSWER_URL", "")
 INTERNAL_API_KEY  = os.getenv("INTERNAL_API_KEY", "")  # shared secret for calling call_handler.py
-SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY")
-SUPABASE_URL      = os.getenv("SUPABASE_URL")
 
 if not DEEPGRAM_API_KEY:
     raise ValueError("DEEPGRAM_API_KEY missing")
@@ -199,7 +206,13 @@ FUNCTIONS: List[Dict] = [
         "name": "update_lead_facts",
         "description": (
             "Call whenever new info is learned: company, budget, timeline, "
-            "pain points, interested services. Partial updates OK."
+            "pain points, interested services, whether they already have a "
+            "website, whether they're the decision maker. Partial updates OK. "
+            "Set wants_email_capture=true the moment you ask for their email "
+            "(before they've said anything back) — this hands listening for "
+            "it over to a dedicated capture flow so a spelled-out address "
+            "isn't mis-heard/garbled by you reading it back. Don't set the "
+            "email field yourself; the capture flow sets it once confirmed."
         ),
         "parameters": {
             "type": "object",
@@ -209,8 +222,39 @@ FUNCTIONS: List[Dict] = [
                 "timeline":            {"type": ["string", "null"]},
                 "pain_points":         {"type": ["array", "null"], "items": {"type": "string"}},
                 "interested_services": {"type": ["array", "null"], "items": {"type": "string"}},
+                "has_website":         {"type": ["boolean", "null"]},
+                "is_decision_maker":   {"type": ["boolean", "null"]},
+                "wants_email_capture": {"type": ["boolean", "null"]},
             },
             "required": [],
         },
     },
 ]
+
+# NEW — browser-facing endpoint guard for this service (aiohttp doesn't
+# have FastAPI's Depends(), so this is called manually at the top of
+# outbound_call / resolve_call_uuid in routes.py). Mirrors
+# call_handler_app's require_user() — same header, same Supabase check —
+# via a direct REST call instead of the `supabase` client library, so a
+# transient Supabase hiccup can't hang this on a blocking SDK call inside
+# a hot request path. Returns True if the caller is authenticated, or
+# writes a 401 web.json_response and returns False otherwise (aiohttp
+# handlers check the return value and `return` early on False — no
+# exception-based flow control here since aiohttp's own HTTPException
+# equivalent works differently from FastAPI's).
+async def check_user_auth(request) -> bool:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return False
+    token = auth_header[len("Bearer "):].strip()
+    if not token or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_SERVICE_ROLE_KEY},
+            )
+        return r.status_code == 200
+    except Exception:
+        return False

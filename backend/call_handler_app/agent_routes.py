@@ -8,10 +8,10 @@ import os
 from datetime import datetime
 from typing import Dict, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
-from .config import DEFAULT_AGENT_ID, _get_supabase, _with_retry, get_agent_config
+from .config import DEFAULT_AGENT_ID, _get_supabase, _with_retry, get_agent_config, require_user
 
 router = APIRouter()
 
@@ -41,7 +41,7 @@ async def get_config(agent_id: str = DEFAULT_AGENT_ID):
 
 
 @router.patch("/api/agents/{agent_id}/toggle")
-async def toggle_agent(agent_id: str, request: Request):
+async def toggle_agent(agent_id: str, request: Request, _user=Depends(require_user)):
     body      = await request.json()
     is_active = bool(body.get("is_active"))
     def _update():
@@ -51,7 +51,7 @@ async def toggle_agent(agent_id: str, request: Request):
 
 
 @router.get("/api/agents/active-count")
-async def active_agent_count():
+async def active_agent_count(_user=Depends(require_user)):
     def _counts():
         total  = _get_supabase().table("agents").select("agent_id", count="exact").execute()
         active = _get_supabase().table("agents").select("agent_id", count="exact").eq("is_active", True).execute()

@@ -31,12 +31,9 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .config import _get_supabase, _with_retry, business_status, logger, plivo_client, rate_limit, require_user
+from .config import _get_supabase, _with_retry, business_status, logger, plivo_client, require_user
 
-# FIX (backend auth gap): every route in this file is called directly by
-# the logged-in dashboard, never by server_app or a Plivo webhook — safe
-# to gate the whole router at once instead of annotating each route.
-router = APIRouter(dependencies=[Depends(require_user)])
+router = APIRouter()
 
 NON_TERMINAL = {"QUEUED", "DIALING", "RINGING", "IN_PROGRESS"}
 
@@ -124,7 +121,7 @@ def _try_recover_stale(attempt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 @router.post("/api/campaigns")
-async def create_campaign(request: Request):
+async def create_campaign(request: Request, _user=Depends(require_user)):
     body = await request.json()
     agent_id = (body.get("agent_id") or "").strip()
     if not agent_id:
@@ -155,7 +152,7 @@ async def create_campaign(request: Request):
 
 
 @router.get("/api/campaigns")
-async def list_campaigns(agent_id: Optional[str] = None, limit: int = 20):
+async def list_campaigns(agent_id: Optional[str] = None, limit: int = 20, _user=Depends(require_user)):
     """Recent campaigns, newest first — powers the dashboard's 'Resume a
     past campaign' picker (resumeCampaign() in batchCallStore.js). Without
     this, a campaign_id was only known by whoever created it in that
@@ -170,7 +167,7 @@ async def list_campaigns(agent_id: Optional[str] = None, limit: int = 20):
 
 
 @router.delete("/api/campaigns/{campaign_id}")
-async def delete_campaign(campaign_id: str):
+async def delete_campaign(campaign_id: str, _user=Depends(require_user)):
     """Frees space once a batch is done and you only care about HOT leads
     (those already live independently in `calls`, written by
     process_transcript_pipeline — deleting a campaign never touches that).
@@ -186,7 +183,7 @@ async def delete_campaign(campaign_id: str):
 
 
 @router.get("/api/campaigns/{campaign_id}/leads")
-async def get_campaign_leads(campaign_id: str):
+async def get_campaign_leads(campaign_id: str, _user=Depends(require_user)):
     """Single source of truth for the UI — status per lead comes from
     the DB, not browser memory. Includes each lead's latest attempt."""
     def _load():
@@ -210,14 +207,13 @@ async def get_campaign_leads(campaign_id: str):
 
 
 @router.post("/api/campaigns/{campaign_id}/dial/{lead_id}")
-async def dial_lead(campaign_id: str, lead_id: str, user=Depends(require_user)):
+async def dial_lead(campaign_id: str, lead_id: str, _user=Depends(require_user)):
     """ATOMIC claim — the fix for duplicate-call risk (see module
     docstring). Only the caller that wins the DB-level claim is told
     reused=False; that's the ONLY caller allowed to proceed to
     server.py's /api/outbound-call and actually invoke Plivo. Every
     other caller — a second tab, a retried request, a resume after
     refresh — gets reused=True and the winner's row, and must NOT dial."""
-    rate_limit(f"dial:{user.id}", max_calls=20, window_s=60)
     def _get_lead():
         return _get_supabase().table("campaign_leads").select("*").eq("lead_id", lead_id).single().execute().data
     lead = await asyncio.to_thread(_with_retry, _get_lead)
@@ -280,7 +276,7 @@ async def dial_lead(campaign_id: str, lead_id: str, user=Depends(require_user)):
 
 
 @router.patch("/api/campaigns/attempts/{attempt_id}")
-async def update_attempt(attempt_id: str, request: Request):
+async def update_attempt(attempt_id: str, request: Request, _user=Depends(require_user)):
     """Called right after Plivo returns call_uuid (business_status ->
     DIALING), and by the reconciliation pass for stuck rows."""
     body  = await request.json()
@@ -316,7 +312,7 @@ async def update_attempt(attempt_id: str, request: Request):
 
 
 @router.post("/api/campaigns/{campaign_id}/reconcile")
-async def reconcile_campaign(campaign_id: str, stuck_after_s: int = STUCK_WITH_UUID_TIMEOUT_S):
+async def reconcile_campaign(campaign_id: str, stuck_after_s: int = STUCK_WITH_UUID_TIMEOUT_S, _user=Depends(require_user)):
     """FALLBACK — repairs two distinct kinds of stuck rows so DB state
     stays authoritative and every lead eventually converges to a
     terminal status, without ever double-dialing:

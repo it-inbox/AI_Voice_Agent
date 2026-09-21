@@ -10,3 +10,14 @@ if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
 }
 
 export const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+
+// NEW — root cause of "Missing or invalid Authorization header" / 401
+// unauthorized on campaigns + outbound-call: backend's require_user()
+// expects a Supabase Bearer token, but no fetch() call anywhere in this
+// frontend ever attached one. Central helper so every backend call can
+// pull it in consistently.
+export async function authHeader() {
+  const { data } = await supabase.auth.getSession()
+  const token = data?.session?.access_token
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}

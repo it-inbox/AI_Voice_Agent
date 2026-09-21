@@ -13,6 +13,7 @@
 // second confirm click if there are invalid/duplicate rows.
 import * as XLSX from 'xlsx'
 import { useState, useEffect } from 'react'
+import { authHeader } from '../supabaseClient'
 import { supabase } from '../supabaseClient'
 
 export const COUNTRY_CODES = [
@@ -259,7 +260,7 @@ async function ensureCampaign(callHandlerUrl) {
     raw_row: Object.fromEntries(state.columns.map(c => [c, r[c]])),
   }))
   const res = await fetch(`${callHandlerUrl}/api/campaigns`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...await authHeader() },
     body: JSON.stringify({ agent_id: state.agentId, file_name: state.fileName, leads }),
   })
   const data = await res.json()
@@ -276,13 +277,13 @@ function startReconcileLoop(callHandlerUrl) {
   control.reconcileTimer = setInterval(async () => {
     if (!state.campaignId) return
     try {
-      await fetch(`${callHandlerUrl}/api/campaigns/${state.campaignId}/reconcile`, { method: 'POST' })
+      await fetch(`${callHandlerUrl}/api/campaigns/${state.campaignId}/reconcile`, { method: 'POST', headers: { ...await authHeader() } })
       // BUG FIX: reconcile used to only patch the backend row; the local
       // `state.rows` (what the table actually renders) was never synced,
       // so any row whose waitForOutcome() hit the 30s timeout stayed
       // stuck showing a stale status in the UI forever. Pull the
       // authoritative lead list back and patch local rows that drifted.
-      const res = await fetch(`${callHandlerUrl}/api/campaigns/${state.campaignId}/leads`)
+      const res = await fetch(`${callHandlerUrl}/api/campaigns/${state.campaignId}/leads`, { headers: { ...await authHeader() } })
       const data = await res.json()
       if (!res.ok || !data.leads) return
       let changed = false
@@ -314,7 +315,7 @@ async function dialRow(row, rowIdx, voiceServerUrl, callHandlerUrl) {
 
   let attemptId
   try {
-    const r = await fetch(`${callHandlerUrl}/api/campaigns/${state.campaignId}/dial/${row.__lead_id}`, { method: 'POST' })
+    const r = await fetch(`${callHandlerUrl}/api/campaigns/${state.campaignId}/dial/${row.__lead_id}`, { method: 'POST', headers: { ...await authHeader() } })
     const d = await r.json()
     if (!r.ok) throw new Error(d.detail || 'dial reservation failed')
     attemptId = d.attempt_id
@@ -342,14 +343,14 @@ async function dialRow(row, rowIdx, voiceServerUrl, callHandlerUrl) {
   setCurrentLog({ row: rowIdx + 1, phone: to, message: 'Calling…', level: 'info' })
   try {
     const res = await fetch(`${voiceServerUrl}/api/outbound-call`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...await authHeader() },
       body: JSON.stringify({ to, agent_id: state.agentId, name: String(leadName).trim() }),
     })
     const data = await res.json()
     if (!res.ok || data.error) {
       updateRow(rowIdx, { __status: BATCH_STATUSES.FAILED })
       await fetch(`${callHandlerUrl}/api/campaigns/attempts/${attemptId}`, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        method: 'PATCH', headers: { 'Content-Type': 'application/json', ...await authHeader() },
         body: JSON.stringify({ business_status: 'FAILED', failure_reason: data.error || res.statusText }),
       })
       setCurrentLog({ row: rowIdx + 1, phone: to, message: 'Failed: ' + (data.error || res.statusText), level: 'err' })
@@ -363,7 +364,7 @@ async function dialRow(row, rowIdx, voiceServerUrl, callHandlerUrl) {
     if (!resolvedCallUuid) {
       updateRow(rowIdx, { __status: BATCH_STATUSES.FAILED })
       await fetch(`${callHandlerUrl}/api/campaigns/attempts/${attemptId}`, {
-        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        method: 'PATCH', headers: { 'Content-Type': 'application/json', ...await authHeader() },
         body: JSON.stringify({ business_status: 'FAILED', failure_reason: 'no call_uuid — answer webhook never fired' }),
       })
       setCurrentLog({ row: rowIdx + 1, phone: to, message: 'No call_uuid — answer webhook never fired', level: 'err' })
@@ -377,7 +378,7 @@ async function dialRow(row, rowIdx, voiceServerUrl, callHandlerUrl) {
     // in-flight row again for another wave before reconcile ever ran.
     updateRow(rowIdx, { __call_uuid: data.call_uuid, __status: 'DIALING' })
     await fetch(`${callHandlerUrl}/api/campaigns/attempts/${attemptId}`, {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      method: 'PATCH', headers: { 'Content-Type': 'application/json', ...await authHeader() },
       body: JSON.stringify({ call_uuid: data.call_uuid, business_status: 'DIALING' }),
     })
     await waitForOutcome(data.call_uuid, rowIdx)
@@ -400,7 +401,7 @@ async function pollResolveCallUuid(voiceServerUrl, dashId, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     try {
-      const r = await fetch(`${voiceServerUrl}/api/resolve-call-uuid?dash_id=${encodeURIComponent(dashId)}`)
+      const r = await fetch(`${voiceServerUrl}/api/resolve-call-uuid?dash_id=${encodeURIComponent(dashId)}`, { headers: { ...await authHeader() } })
       const d = await r.json()
       if (r.ok && d.call_uuid) return d.call_uuid
     } catch { /* keep polling */ }
@@ -600,21 +601,21 @@ export function exportBatchSheet() {
 }
 
 export async function listCampaigns(agentId, callHandlerUrl) {
-  const res = await fetch(`${callHandlerUrl}/api/campaigns?agent_id=${encodeURIComponent(agentId)}`)
+  const res = await fetch(`${callHandlerUrl}/api/campaigns?agent_id=${encodeURIComponent(agentId)}`, { headers: { ...await authHeader() } })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail || 'Failed to list campaigns')
   return data.campaigns || []
 }
 
 export async function deleteCampaign(campaignId, callHandlerUrl) {
-  const res = await fetch(`${callHandlerUrl}/api/campaigns/${campaignId}`, { method: 'DELETE' })
+  const res = await fetch(`${callHandlerUrl}/api/campaigns/${campaignId}`, { method: 'DELETE', headers: { ...await authHeader() } })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail || 'Failed to delete campaign')
   return data
 }
 
 export async function resumeCampaign(campaignId, callHandlerUrl) {
-  const res = await fetch(`${callHandlerUrl}/api/campaigns/${campaignId}/leads`)
+  const res = await fetch(`${callHandlerUrl}/api/campaigns/${campaignId}/leads`, { headers: { ...await authHeader() } })
   const data = await res.json()
   if (!res.ok) throw new Error(data.detail || 'Failed to load campaign')
   state.campaignId = campaignId; state.hasStarted = true

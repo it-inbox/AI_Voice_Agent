@@ -244,6 +244,8 @@ async def place_outbound_call(to_number: str, agent_id: str, host: str, lead_nam
             answer_method="POST",
             hangup_url=hangup_url,
             hangup_method="POST",
+            machine_detection="true",          # NEW — see plivo_answer()'s Machine check
+            machine_detection_time=4000,        # ms — matches existing AMD_SPEECH_TIMEOUT_S(4.0) for continuity
         )
     except Exception as e:
         log.error("outbound call create failed — to=%s agent_id=%s: %s", to_number, agent_id, e)

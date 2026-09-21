@@ -94,6 +94,18 @@ async def plivo_answer(request: web.Request) -> web.Response:
         if len(_answered_call_uuids) > 500:
             _answered_call_uuids.pop()
 
+    # NEW — Plivo's own Answering Machine Detection. machine_detection="true"
+    # (no separate machine_detection_url — see place_outbound_call) makes
+    # Plivo hold this webhook until its analysis finishes, so `Machine` is
+    # already resolved by the time we're here — no race with starting the
+    # conversation. iPhone/carrier voicemail is exactly this case: the
+    # call gets "answered" by voicemail, not a person. Skip the whole AI
+    # pipeline (no Stream, no STT/LLM/TTS cost) and hang up immediately.
+    if params.get("Machine", "").lower() == "true":
+        clog(call_uuid, f"Plivo AMD: machine/voicemail detected — to={to_number} — hanging up, no AI pipeline")
+        xml = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+        return web.Response(text=xml, content_type="application/xml")
+
     # NEW — this is the FIRST point the real Plivo CallUUID exists. Record
     # it against our own dash_id (set on the answer_url by
     # place_outbound_call) so /api/outbound-call and /api/resolve-call-uuid

@@ -317,16 +317,27 @@ async def unlink_plivo_number(request: Request, _user=Depends(require_user)):
 def _single_call_display_status(call_status: Optional[str], hangup_cause: Optional[str]) -> str:
     """Friendly status for a single/manual dashboard call only — kept
     separate from business_status() above (that one's for bulk campaign
-    attempts) per the ask to touch only single-call display."""
+    attempts) per the ask to touch only single-call display.
+
+    FIX (real bug: showed "Ended" right after "Call placed"): this used
+    to treat ANY unrecognized call_status as terminal/Ended — including
+    empty/None, which Plivo returns for a beat right after call creation
+    before its own records catch up. Now only an explicit terminal status
+    from Plivo counts as Ended; anything else (known in-progress states,
+    or a status we don't recognize yet) is treated as still ongoing,
+    never terminal by default."""
     cs = (call_status or "").lower()
     hc = (hangup_cause or "").lower()
+    _TERMINAL = {"completed", "failed", "no-answer", "no_answer", "timeout", "canceled", "cancelled"}
     if cs == "queued":
         return "Call placed"
     if cs in ("ringing", "in-progress"):
         return "Ongoing"
     if cs == "busy" or "reject" in hc or "declin" in hc or "busy" in hc:
         return "Rejected"
-    return "Ended"   # completed / failed / no-answer / canceled / anything else terminal
+    if cs in _TERMINAL:
+        return "Ended"
+    return "Ongoing"   # unknown/empty call_status — assume still connecting, never default to terminal
 
 
 @router.get("/api/plivo/call-status")
@@ -334,6 +345,36 @@ async def plivo_call_status(call_uuid: str, _user=Depends(require_user)):
     call_uuid = (call_uuid or "").strip()
     if not call_uuid:
         raise HTTPException(status_code=400, detail="call_uuid is required")
+
+    # FIX (real bug: showed "Ended" 18s before Plivo's own Call End Time)
+    # — Plivo's calls.get() REST status is not a reliable "has this call
+    # actually ended" signal for calls using <Stream keepCallAlive="true">;
+    # its call_status can look terminal while the live media session is
+    # still up. /plivo/hangup (see plivo_hangup above) only fires once,
+    # at the exact instant Plivo's own CDR is final — the same moment as
+    # the Call End Time shown in Plivo's dashboard — and writes
+    # hangup_cause onto this call's `calls` row. That's the one
+    # authoritative "ended" signal; check it FIRST, before ever asking
+    # Plivo's live API, which is only used now for the pre-hangup
+    # Call-placed/Ongoing/Rejected labels.
+    def _get_calls_row():
+        return (
+            _get_supabase().table("calls").select("hangup_cause")
+            .eq("call_sid", call_uuid).limit(1).execute()
+        )
+    try:
+        row_result = await asyncio.to_thread(_with_retry, _get_calls_row)
+        db_hangup_cause = row_result.data[0]["hangup_cause"] if row_result.data else None
+    except Exception:
+        db_hangup_cause = None   # DB hiccup — fall through to live Plivo status below, never invent "Ended"
+    if db_hangup_cause:
+        hc = db_hangup_cause.lower()
+        label = "Rejected" if ("reject" in hc or "declin" in hc or "busy" in hc) else "Ended"
+        return JSONResponse({
+            "status": "ok", "call_uuid": call_uuid, "hangup_cause": db_hangup_cause,
+            "display_status": label,
+        })
+
     def _get():
         return plivo_client.calls.get(call_uuid)
     try:
@@ -341,7 +382,7 @@ async def plivo_call_status(call_uuid: str, _user=Depends(require_user)):
     except asyncio.TimeoutError:
         return JSONResponse({"status": "timeout", "call_uuid": call_uuid, "display_status": "Ongoing"})
     except Exception as e:
-        return JSONResponse({"status": "not_found", "call_uuid": call_uuid, "detail": str(e), "display_status": "Ended"})
+        return JSONResponse({"status": "not_found", "call_uuid": call_uuid, "detail": str(e), "display_status": "Ongoing"})
     call_status  = getattr(call, "call_status", None) or (call.get("call_status") if isinstance(call, dict) else None)
     end_time     = getattr(call, "end_time", None) or (call.get("end_time") if isinstance(call, dict) else None)
     hangup_cause = (
